@@ -727,7 +727,7 @@ mod tests {
         broker.add_topic_consumer(consumer3).unwrap();
         broker.add_topic_consumer(consumer4).unwrap();
 
-        let events = vec![
+        let events = [
             EventMessage::new("test.one", "consumer2 stuff test1").unwrap(),
             EventMessage::new("test.two", "consumer2 stuff test2").unwrap(),
             EventMessage::new("test.three", "consumer2 stuff test3").unwrap(),
