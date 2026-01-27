@@ -4,7 +4,7 @@ description = "an embeddable topic-based messaging system"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 homepage = "https://github.com/sashakm/topmesys"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
@@ -12,7 +12,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 dashmap = "6.1"
 futures-util = "0.3"
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "signal"] }
 tokio-stream = "0.1"
 tracing = "0.1"
 bytes = "1.11"
