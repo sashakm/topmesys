@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+    branches: [ '*' ]
+    tags: [ '^(v)?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?$' ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Run linter and code quality checks
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_INCREMENTAL: 0
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt,clippy
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: just
+    - uses: Swatinem/rust-cache@v2
+    - uses: mozilla-actions/sccache-action@v0.0.9
+    - name: Run checks
+      run: just check
+  testing:
+    name: Run all tests
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_INCREMENTAL: 0
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-llvm-cov,just
+    - uses: Swatinem/rust-cache@v2
+    - uses: mozilla-actions/sccache-action@v0.0.9
+    - name: Run tests
+      run: just test
+    - name: Upload coverage report
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@v5
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: coverage.xml
+        fail_ci_if_error: false

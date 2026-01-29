@@ -1,7 +1,8 @@
 # topmesys 
 
-[![pipeline status]()](https://github.com/sashakm/topmesys)
-[![coverage]()](https://github.com/sashakm/topmesys)
+[![pipeline status](https://github.com/sashakm/topmesys/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sashakm/topmesys)
+[![coverage](https://codecov.io/gh/sashakm/topmesys/branch/main/graph/badge.svg)](https://codecov.io/gh/sashakm/topmesys)
+[![Crates.io](https://img.shields.io/crates/v/topmesys.svg)](https://crates.io/crates/topmesys)
 
 An embeddable topic-based message broker.
 
