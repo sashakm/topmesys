@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-04-11
+
+### ⚙️ Miscellaneous Tasks
+
+- Create basic workflow definition to run checks and tests
+- Create basic workflow definition to run checks and tests
+- Add dependabot config
+- Refine ci build dependency caching and limit run trigger conditions to pushes to main branch
+- Update dependencies
+
 ## [0.1.2] - 2026-01-27
 
 ### ⚙️ Miscellaneous Tasks
