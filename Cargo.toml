@@ -16,3 +16,11 @@ tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "signal"] }
 tokio-stream = "0.1"
 tracing = "0.1"
 bytes = "1.12"
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["async_tokio"] }
+tokio = { version = "1.52", features = ["time"] }
+
+[[bench]]
+name = "broker"
+harness = false
