@@ -10,7 +10,7 @@
 //!
 //! Run with: `cargo run --example order_pipeline`
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use topmesys::{EventBroker, EventConsumer, EventEmitter, EventMessage, EventSubmission};
@@ -23,7 +23,7 @@ struct Service {
 
 #[async_trait::async_trait]
 impl EventConsumer for Service {
-    fn consumes(&self) -> &String {
+    fn consumes(&self) -> &str {
         &self.topic
     }
 
@@ -88,12 +88,10 @@ async fn main() -> anyhow::Result<()> {
     ]
     .into_iter()
     .map(|(topic, payload)| EventMessage::new(topic, payload))
-    .collect::<anyhow::Result<EventSubmission>>()?;
+    .collect::<Result<EventSubmission, _>>()?;
     orders.submit_event(batch).await?;
 
-    // Give in-flight handlers a moment before shutting down; handlers picked up
-    // before the stop signal are processed on detached tasks.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Stopping drains all buffered messages and waits for in-flight handlers to finish.
     broker.stop().await;
 
     Ok(())

@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, fmt::Display, marker::PhantomData, sync::Arc};
+use std::{fmt::Display, marker::PhantomData, sync::Arc};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -41,12 +41,44 @@ pub mod type_states {
     impl StateMarker for Running {}
 }
 
+/// Errors that can occur when parsing and validating [EventTopic]s.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TopicError {
+    #[error("topic cannot be empty")]
+    EmptyTopic,
+    #[error(
+        "invalid character in topic `{topic}`: topics may only contain alphanumeric characters and {allowed:?}"
+    )]
+    InvalidCharacter {
+        topic: String,
+        allowed: &'static [char],
+    },
+    #[error("found empty segment")]
+    EmptySegment,
+    #[error("invalid selection segment `{0}`")]
+    InvalidSelection(String),
+    #[error("invalid value `{value}` in selection segment `{segment}`")]
+    InvalidSelectionValue { segment: String, value: String },
+    #[error("found `,` outside of a selection segment: `{0}`")]
+    UnbracketedComma(String),
+    #[error("`*` must make up the entire segment: `{0}`")]
+    EmbeddedWildcard(String),
+}
+
+/// Errors that can occur when operating an [EventBroker].
+#[derive(Debug, thiserror::Error)]
+pub enum BrokerError {
+    #[error("no tokio runtime available to run the event loop")]
+    Runtime(#[from] tokio::runtime::TryCurrentError),
+}
+
 /// A type representing a single topic segment. Topic segments are used to match against other topic segments. Literal segments
 /// matched against other literal segments must be equal. Selection segments are matched against literal segments by checking if the literal segment
 /// value is contained within the selection segment. Wildcard segments match against any segment. Selection segments are defined by square brackets and comma separated values.
 /// When parsing selection segments, and inside the selection a wildcard segment is found, the entire selection will be parsed as wildcard. If a selection segment contains only a single
 /// value, the segment will be parsed as literal. Multiple values will be sorted and deduplicated, so selection segment lookups should be fairly quick.
-/// Wildcard segments are defined by a single asterisk. Literal segments are any other string.
+/// Wildcard segments are defined by a single asterisk. Literal segments are any other string. Selection values must be non-empty and may not
+/// contain brackets or embedded wildcards; segments that could never match a routing key (like `[a,]` or `a[b]`) are rejected when parsed.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum TopicSegment {
     Literal(String),
@@ -64,40 +96,44 @@ impl TopicSegment {
         }
     }
 
-    fn parse(text: &str) -> anyhow::Result<Self> {
-        let literal_wildcard = "*".to_string();
+    fn parse(text: &str) -> Result<Self, TopicError> {
         if text.is_empty() {
-            anyhow::bail!("Found empty segment.");
+            return Err(TopicError::EmptySegment);
         }
-        if text == literal_wildcard {
+        if text == "*" {
             return Ok(Self::Wildcard);
         }
-        if text.starts_with('[') && !text.ends_with(']')
-            || text.ends_with(']') && !text.starts_with('[')
-            || text.starts_with('[') && text.len() <= 2
-        {
-            anyhow::bail!("Invalid selection segment: {text}");
-        }
-        if !text.starts_with('[') && text.contains(',') {
-            anyhow::bail!("Found `,` outside of selection segment: {text}");
-        }
         if text.starts_with('[') && text.ends_with(']') {
-            let mut bracketed = text[1..text.len() - 1]
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect::<Vec<_>>();
-            if bracketed.contains(&literal_wildcard) {
-                Ok(Self::Wildcard)
-            } else if bracketed.len() == 1 {
-                Ok(Self::Literal(bracketed[0].clone()))
-            } else {
-                bracketed.sort();
-                bracketed.dedup();
-                Ok(Self::Selection(bracketed))
+            let mut values = Vec::new();
+            for value in text[1..text.len() - 1].split(',').map(str::trim) {
+                if value == "*" {
+                    return Ok(Self::Wildcard);
+                }
+                if value.is_empty() || value.contains(['[', ']', '*']) {
+                    return Err(TopicError::InvalidSelectionValue {
+                        segment: text.to_string(),
+                        value: value.to_string(),
+                    });
+                }
+                values.push(value.to_string());
             }
-        } else {
-            Ok(Self::Literal(text.to_string()))
+            values.sort();
+            values.dedup();
+            if values.len() == 1 {
+                return Ok(Self::Literal(values.pop().expect("one value is present")));
+            }
+            return Ok(Self::Selection(values));
         }
+        if text.contains(['[', ']']) {
+            return Err(TopicError::InvalidSelection(text.to_string()));
+        }
+        if text.contains(',') {
+            return Err(TopicError::UnbracketedComma(text.to_string()));
+        }
+        if text.contains('*') {
+            return Err(TopicError::EmbeddedWildcard(text.to_string()));
+        }
+        Ok(Self::Literal(text.to_string()))
     }
 }
 
@@ -109,6 +145,8 @@ impl TopicSegment {
 /// enabling literal, wildcard (`*`) and selection (`[val1,val2,valN]`) segments. This will also enable tail matching if a wildcard segment is found at the end of the topic.
 /// If many wildcard segments are found at the end of the pattern, one will be kept and the rest discarded, as it won't affect matching. A topic
 /// consisting of a single wildcard segment matches any other topic.
+///
+/// Topic strings are lowercased when the topic is created, making topic matching case-insensitive: `Orders.EU` and `orders.eu` are the same topic.
 #[derive(Debug, Default, Clone, Hash, PartialEq, Eq)]
 pub struct EventTopic<S: StateMarker> {
     s: PhantomData<S>,
@@ -133,7 +171,7 @@ impl EventTopic<()> {
 }
 
 impl EventTopic<Init> {
-    pub fn as_routing_key(self) -> anyhow::Result<EventTopic<RoutingKey>> {
+    pub fn as_routing_key(self) -> Result<EventTopic<RoutingKey>, TopicError> {
         self.sanitize_topic(&['.', '-', '_'])?;
         let segments = self.parse_segments()?;
         let new = EventTopic {
@@ -147,7 +185,7 @@ impl EventTopic<Init> {
         Ok(new)
     }
 
-    pub fn as_subscription(self) -> anyhow::Result<EventTopic<Pattern>> {
+    pub fn as_subscription(self) -> Result<EventTopic<Pattern>, TopicError> {
         self.sanitize_topic(&['.', ',', '*', '[', ']', '-', '_'])?;
         let mut new = EventTopic {
             s: PhantomData::<Pattern>,
@@ -181,7 +219,7 @@ impl EventTopic<Init> {
         Ok(new)
     }
 
-    fn parse_segments(&self) -> anyhow::Result<Vec<TopicSegment>> {
+    fn parse_segments(&self) -> Result<Vec<TopicSegment>, TopicError> {
         let mut parsed_segments = Vec::new();
         for segment in self.raw.split('.') {
             parsed_segments.push(TopicSegment::parse(segment)?);
@@ -189,19 +227,19 @@ impl EventTopic<Init> {
         Ok(parsed_segments)
     }
 
-    fn sanitize_topic(&self, extra_keys: &[char]) -> anyhow::Result<()> {
+    fn sanitize_topic(&self, extra_keys: &'static [char]) -> Result<(), TopicError> {
         if self.raw.is_empty() {
-            anyhow::bail!("Topic cannot be empty.");
+            return Err(TopicError::EmptyTopic);
         }
         if !self
             .raw
             .chars()
             .all(|c| c.is_alphanumeric() || extra_keys.contains(&c))
         {
-            anyhow::bail!(
-                "Invalid character in topic: {}. Topics may only contain alphanumeric characters and {extra_keys:?}.",
-                self.raw
-            );
+            return Err(TopicError::InvalidCharacter {
+                topic: self.raw.clone(),
+                allowed: extra_keys,
+            });
         }
         Ok(())
     }
@@ -260,9 +298,15 @@ pub enum EventSubmission {
     Batch(Vec<EventMessage>),
 }
 
-impl<B: Borrow<EventMessage>> From<B> for EventSubmission {
-    fn from(value: B) -> Self {
-        Self::Single(value.borrow().to_owned())
+impl From<EventMessage> for EventSubmission {
+    fn from(value: EventMessage) -> Self {
+        Self::Single(value)
+    }
+}
+
+impl From<&EventMessage> for EventSubmission {
+    fn from(value: &EventMessage) -> Self {
+        Self::Single(value.clone())
     }
 }
 
@@ -301,8 +345,19 @@ pub trait EventEmitter: std::fmt::Debug {
 /// Implementors are registered with an [EventBroker] and receive [EventMessage]s based on [EventTopic]s.
 #[async_trait::async_trait]
 pub trait EventConsumer: std::fmt::Debug + Send + Sync {
-    fn consumes(&self) -> &String;
+    fn consumes(&self) -> &str;
     async fn handle_event(&self, event: Arc<EventMessage>) -> anyhow::Result<()>;
+}
+
+/// Identifies a single registration of an [EventConsumer] with an [EventBroker]. Returned by
+/// [add_topic_consumer](EventBroker::add_topic_consumer) and consumed by
+/// [remove_topic_consumer](EventBroker::remove_topic_consumer) to unsubscribe the consumer again.
+/// The handle holds a [Weak](std::sync::Weak) reference, so keeping it around does not keep the
+/// consumer alive.
+#[derive(Debug, Clone)]
+pub struct SubscriptionHandle {
+    pattern: EventTopic<Pattern>,
+    consumer: std::sync::Weak<dyn EventConsumer>,
 }
 
 /// This is the central bus for all events in the application. It sets up a [channel](tokio::sync::mpsc) and dispatches
@@ -316,6 +371,7 @@ pub trait EventConsumer: std::fmt::Debug + Send + Sync {
 pub struct EventBroker<S: StateMarker> {
     runtime: S,
     subscriptions: EventSubscriptions,
+    handle_ctrl_c: bool,
 }
 
 impl Default for EventBroker<Stopped> {
@@ -329,6 +385,7 @@ impl EventBroker<()> {
         EventBroker {
             runtime: Stopped { bufsize },
             subscriptions: Arc::new(DashMap::new()),
+            handle_ctrl_c: false,
         }
     }
 }
@@ -337,13 +394,40 @@ impl<S> EventBroker<S>
 where
     S: StateMarker + 'static,
 {
-    pub fn add_topic_consumer(&self, consumer: impl EventConsumer + 'static) -> anyhow::Result<()> {
+    pub fn add_topic_consumer(
+        &self,
+        consumer: impl EventConsumer + 'static,
+    ) -> Result<SubscriptionHandle, TopicError> {
         let subscription_pattern = EventTopic::new(consumer.consumes()).as_subscription()?;
+        let consumer: Arc<dyn EventConsumer> = Arc::new(consumer);
+        let handle = SubscriptionHandle {
+            pattern: subscription_pattern.clone(),
+            consumer: Arc::downgrade(&consumer),
+        };
         self.subscriptions
             .entry(subscription_pattern)
             .or_default()
-            .push(Arc::new(consumer));
-        Ok(())
+            .push(consumer);
+        Ok(handle)
+    }
+
+    /// Removes the consumer registration identified by the given [SubscriptionHandle]. Returns
+    /// `true` if the consumer was found and removed, `false` if it was removed before.
+    pub fn remove_topic_consumer(&self, handle: SubscriptionHandle) -> bool {
+        let Some(consumer) = handle.consumer.upgrade() else {
+            return false;
+        };
+        let removed = match self.subscriptions.get_mut(&handle.pattern) {
+            Some(mut consumers) => {
+                let before = consumers.len();
+                consumers.retain(|candidate| !Arc::ptr_eq(candidate, &consumer));
+                consumers.len() < before
+            }
+            None => false,
+        };
+        self.subscriptions
+            .remove_if(&handle.pattern, |_, consumers| consumers.is_empty());
+        removed
     }
 
     pub fn get_subscriptions(&self) -> &EventSubscriptions {
@@ -364,23 +448,59 @@ where
         receiver: mpsc::Receiver<EventMessage>,
         mut stop_rx: watch::Receiver<bool>,
     ) {
-        let stop_signal = tokio::signal::ctrl_c();
-        let stop_call = stop_rx.changed();
-        let stop = select(Box::pin(stop_signal), Box::pin(stop_call));
-        let mut event_stream = ReceiverStream::new(receiver);
-        tokio::select! {
-            biased;
-            _ = stop => {
-                tracing::info!("Stopping event stream processing.");
-                event_stream.close();
-                event_stream.for_each(|event_msg| async move {Self::publish_event(self.find_consumer(event_msg.topic()), Arc::new(event_msg.clone())).await}).await;
+        let handle_ctrl_c = self.handle_ctrl_c;
+        let stop_signal = async move {
+            if handle_ctrl_c {
+                if let Err(e) = tokio::signal::ctrl_c().await {
+                    tracing::error!("Failed to listen for the ctrl-c signal: {e}");
+                    std::future::pending::<()>().await
+                }
+            } else {
+                std::future::pending::<()>().await
             }
-            _ = async {
-                event_stream.by_ref().for_each_concurrent(0, |event_msg| async move {
-                    tokio::spawn(Self::publish_event(self.find_consumer(event_msg.topic()), Arc::new(event_msg.clone())));
-                }).await;
-            } => {
-                tracing::info!("Event loop processing ended. Shutting down broker. ");
+        };
+        let stop_call = stop_rx.changed();
+        let mut stop = select(Box::pin(stop_signal), Box::pin(stop_call));
+        let mut event_stream = ReceiverStream::new(receiver);
+        let mut handlers = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stop => {
+                    tracing::info!("Stopping event stream processing.");
+                    event_stream.close();
+                    break;
+                }
+                Some(result) = handlers.join_next(), if !handlers.is_empty() => {
+                    if let Err(e) = result {
+                        tracing::error!("Event handler task failed: {e}");
+                    }
+                }
+                maybe_msg = event_stream.next() => match maybe_msg {
+                    Some(event_msg) => {
+                        handlers.spawn(Self::publish_event(
+                            self.find_consumer(event_msg.topic()),
+                            Arc::new(event_msg),
+                        ));
+                    }
+                    None => {
+                        tracing::info!("Event loop processing ended. Shutting down broker.");
+                        break;
+                    }
+                },
+            }
+        }
+        // Drain events still buffered in the channel, then wait for all in-flight handlers,
+        // so no accepted message is lost and none is still being processed after `stop` returns.
+        while let Some(event_msg) = event_stream.next().await {
+            handlers.spawn(Self::publish_event(
+                self.find_consumer(event_msg.topic()),
+                Arc::new(event_msg),
+            ));
+        }
+        while let Some(result) = handlers.join_next().await {
+            if let Err(e) = result {
+                tracing::error!("Event handler task failed: {e}");
             }
         }
     }
@@ -396,12 +516,21 @@ where
 }
 
 impl EventBroker<Stopped> {
-    pub fn run(self) -> anyhow::Result<EventBroker<Running>> {
-        let rt = tokio::runtime::Handle::current();
+    /// Additionally stops the running broker when the process receives a ctrl-c signal. This is
+    /// opt-in, as listening for process signals from within a library may conflict with the
+    /// embedding application's own signal handling.
+    pub fn with_ctrl_c_handling(mut self) -> Self {
+        self.handle_ctrl_c = true;
+        self
+    }
+
+    pub fn run(self) -> Result<EventBroker<Running>, BrokerError> {
+        let rt = tokio::runtime::Handle::try_current()?;
         let (message_tx, message_rx) = mpsc::channel::<EventMessage>(self.runtime.bufsize);
         let (stop_tx, stop_rx) = watch::channel(false);
         let broker = EventBroker {
             subscriptions: self.subscriptions.clone(),
+            handle_ctrl_c: self.handle_ctrl_c,
             runtime: Running {
                 handle: rt.spawn(async move { self.run_event_loop(message_rx, stop_rx).await }),
                 message_tx,
@@ -431,6 +560,7 @@ impl EventBroker<Running> {
                 bufsize: self.runtime.message_tx.max_capacity(),
             },
             subscriptions: self.subscriptions.clone(),
+            handle_ctrl_c: self.handle_ctrl_c,
         }
     }
 
@@ -462,7 +592,10 @@ pub struct EventMessage {
 }
 
 impl EventMessage {
-    pub fn new(topic_text: impl Into<String>, content: impl Into<Bytes>) -> anyhow::Result<Self> {
+    pub fn new(
+        topic_text: impl Into<String>,
+        content: impl Into<Bytes>,
+    ) -> Result<Self, TopicError> {
         Ok(Self {
             topic: EventTopic::new(topic_text.into()).as_routing_key()?,
             content: content.into(),
@@ -546,6 +679,68 @@ mod tests {
         assert_eq!(
             TopicSegment::Literal("one".to_string()),
             single_item_selection
+        );
+        assert_eq!(
+            TopicSegment::Literal("one".to_string()),
+            TopicSegment::parse("[one,one]").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_topic_segment_parse_rejects_malformed_segments() {
+        use super::TopicError;
+
+        assert_eq!(TopicSegment::parse(""), Err(TopicError::EmptySegment));
+        assert_eq!(
+            TopicSegment::parse("[a,]"),
+            Err(TopicError::InvalidSelectionValue {
+                segment: "[a,]".to_string(),
+                value: String::new(),
+            })
+        );
+        assert_eq!(
+            TopicSegment::parse("[,]"),
+            Err(TopicError::InvalidSelectionValue {
+                segment: "[,]".to_string(),
+                value: String::new(),
+            })
+        );
+        assert_eq!(
+            TopicSegment::parse("[]"),
+            Err(TopicError::InvalidSelectionValue {
+                segment: "[]".to_string(),
+                value: String::new(),
+            })
+        );
+        assert_eq!(
+            TopicSegment::parse("[a[b]"),
+            Err(TopicError::InvalidSelectionValue {
+                segment: "[a[b]".to_string(),
+                value: "a[b".to_string(),
+            })
+        );
+        assert_eq!(
+            TopicSegment::parse("[a*b,c]"),
+            Err(TopicError::InvalidSelectionValue {
+                segment: "[a*b,c]".to_string(),
+                value: "a*b".to_string(),
+            })
+        );
+        assert_eq!(
+            TopicSegment::parse("a[b]"),
+            Err(TopicError::InvalidSelection("a[b]".to_string()))
+        );
+        assert_eq!(
+            TopicSegment::parse("[a"),
+            Err(TopicError::InvalidSelection("[a".to_string()))
+        );
+        assert_eq!(
+            TopicSegment::parse("a,b"),
+            Err(TopicError::UnbracketedComma("a,b".to_string()))
+        );
+        assert_eq!(
+            TopicSegment::parse("a*b"),
+            Err(TopicError::EmbeddedWildcard("a*b".to_string()))
         );
     }
 
@@ -674,7 +869,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl EventConsumer for TestConsumer {
-            fn consumes(&self) -> &String {
+            fn consumes(&self) -> &str {
                 &self.topic
             }
 
@@ -780,5 +975,99 @@ mod tests {
                 .flat_map(|entry| entry.value().clone())
                 .all(|v| v != *events.last().unwrap() && v != *events.get(6).unwrap())
         );
+    }
+
+    #[test]
+    fn test_run_outside_runtime_fails() {
+        assert!(EventBroker::new(1).run().is_err());
+    }
+
+    #[test]
+    fn test_remove_topic_consumer() {
+        #[derive(Debug)]
+        struct NoopConsumer;
+
+        #[async_trait::async_trait]
+        impl EventConsumer for NoopConsumer {
+            fn consumes(&self) -> &str {
+                "test.remove"
+            }
+
+            async fn handle_event(&self, _event: Arc<EventMessage>) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let broker = EventBroker::new(1);
+        let handle = broker.add_topic_consumer(NoopConsumer).unwrap();
+        let routing_key = EventTopic::new("test.remove").as_routing_key().unwrap();
+        assert_eq!(broker.find_consumer(&routing_key).len(), 1);
+
+        assert!(broker.remove_topic_consumer(handle.clone()));
+        assert!(broker.find_consumer(&routing_key).is_empty());
+        assert!(broker.get_subscriptions().is_empty());
+        assert!(!broker.remove_topic_consumer(handle));
+    }
+
+    #[tokio::test]
+    async fn test_stop_waits_for_in_flight_handlers() {
+        #[derive(Debug)]
+        struct SlowConsumer {
+            results: Arc<DashMap<String, Vec<EventMessage>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl EventConsumer for SlowConsumer {
+            fn consumes(&self) -> &str {
+                "slow.*"
+            }
+
+            async fn handle_event(&self, event: Arc<EventMessage>) -> anyhow::Result<()> {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                self.results
+                    .entry("slow".to_string())
+                    .or_default()
+                    .push(event.deref().clone());
+                Ok(())
+            }
+        }
+
+        #[derive(Debug)]
+        struct TestEmitter {
+            sender: mpsc::Sender<EventMessage>,
+        }
+
+        #[async_trait::async_trait]
+        impl EventEmitter for TestEmitter {
+            fn get_sender(&self) -> &mpsc::Sender<EventMessage> {
+                &self.sender
+            }
+        }
+
+        let results = Arc::new(DashMap::new());
+        let broker = EventBroker::new(10);
+        broker
+            .add_topic_consumer(SlowConsumer {
+                results: results.clone(),
+            })
+            .unwrap();
+        let broker = broker.run().unwrap();
+        let emitter = TestEmitter {
+            sender: broker.get_sender(),
+        };
+
+        let events = (0..3)
+            .map(|i| EventMessage::new(format!("slow.msg{i}"), "payload").unwrap())
+            .collect::<Vec<_>>();
+        emitter
+            .submit_event(events.iter().cloned().collect())
+            .await
+            .unwrap();
+        // Let the event loop pick up the messages so their handlers are in flight when we stop.
+        tokio::task::yield_now().await;
+
+        let _ = broker.stop().await;
+
+        assert_eq!(results.get("slow").map(|v| v.len()), Some(events.len()));
     }
 }

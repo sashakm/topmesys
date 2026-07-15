@@ -22,8 +22,9 @@ instead of calling each other directly.
   `EventBroker<Running>`.
 - **Batched, cancel-safe submission** — the `EventEmitter` trait submits single messages or
   batches through channel permits.
-- **Graceful shutdown** — buffered messages are drained when the broker is stopped or the
-  process receives Ctrl-C.
+- **Graceful shutdown** — stopping the broker drains all buffered messages and waits for
+  in-flight handlers to finish; stopping on Ctrl-C can be opted into with
+  `with_ctrl_c_handling()`.
 
 Matching messages are dispatched concurrently to all subscribed consumers; messages with no
 matching consumer are dropped silently.
@@ -43,7 +44,7 @@ struct Invoicing {
 
 #[async_trait::async_trait]
 impl EventConsumer for Invoicing {
-    fn consumes(&self) -> &String {
+    fn consumes(&self) -> &str {
         &self.topic
     }
 

@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-07-15
+
+### 🚀 Features
+
+- Add examples and benchmarking
+- Shutdown signal handling is configurable (off by default)
+- Allow unsubscribing consumers from topics
+- Add typed errors
+
+### 🚜 Refactor
+
+- Stabilise shutdown behaviour and enrich api
+- Maintain set of spawned task handlers and handle them individually on shutdown
+- Expand topic validation
+
+### 📚 Documentation
+
+- Expand readme
+
+### ⚙️ Miscellaneous Tasks
+
+- Update dependencies
+
 ## [0.1.3] - 2026-04-11
 
 ### ⚙️ Miscellaneous Tasks

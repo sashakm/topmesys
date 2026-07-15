@@ -20,7 +20,7 @@ struct CountingConsumer {
 
 #[async_trait::async_trait]
 impl EventConsumer for CountingConsumer {
-    fn consumes(&self) -> &String {
+    fn consumes(&self) -> &str {
         &self.topic
     }
 
