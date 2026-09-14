@@ -17,39 +17,77 @@ instead of calling each other directly.
 - **Flexible patterns** — subscription topics support literal segments (`orders`), wildcards
   (`orders.*.created`), selections (`orders.[eu,us].paid`) and tail matching
   (`orders.*` matches `orders.eu`, `orders.eu.created`, ...).
+- **Multi-topic consumers** — a consumer declares several subscriptions, each identified by a
+  value of its own `Topic` type (typically an enum), and handles every message knowing which
+  subscription it arrived on.
+- **Independent subscriptions** — every subscription has its own bounded inbox and worker with
+  configurable concurrency; a concurrency of `1` handles messages strictly in order.
+- **Retries and dead letters** — failed deliveries are retried with fixed, linear or exponential
+  backoff; permanent failures, exhausted retries and overflowing inboxes end up in a
+  `DeadLetterSink`.
+- **Transport handles** — messages bridged in from NATS, Kafka and the like can carry their
+  transport's handle. Consumers can access it, and the broker settles it exactly once with the
+  outcome of every subscription, so the bridge can ack, nak or terminate the message upstream.
 - **Typestate lifecycle** — invalid states are unrepresentable: an `EventTopic` must be turned
   into a routing key or a subscription pattern before use, and messages can only be sent to an
   `EventBroker<Running>`.
 - **Batched, cancel-safe submission** — the `EventEmitter` trait submits single messages or
   batches through channel permits.
 - **Graceful shutdown** — stopping the broker drains all buffered messages and waits for
-  in-flight handlers to finish; stopping on Ctrl-C can be opted into with
+  in-flight deliveries, including pending retries; stopping on Ctrl-C can be opted into with
   `with_ctrl_c_handling()`.
 
-Matching messages are dispatched concurrently to all subscribed consumers; messages with no
-matching consumer are dropped silently.
+Matching messages are delivered to every matching subscription; messages with no matching
+subscription are dropped silently. When a subscription's inbox is full, routing waits for it by
+default (`Overflow::Block`), which means a subscription busy retrying holds up all others once its
+inbox fills. Subscriptions depending on unreliable systems can use `Overflow::DeadLetter` instead.
 
 ## Quick start
 
 ```rust
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use topmesys::{EventBroker, EventConsumer, EventEmitter, EventMessage, EventSubmission};
+use std::time::Duration;
 
-// A consumer subscribes to a topic pattern and handles matching events.
+use tokio::sync::mpsc;
+use topmesys::{
+    Delivery, EventBroker, EventConsumer, EventEmitter, EventMessage, EventSubmission,
+    HandlerError, RetryPolicy, Subscription, Subscriptions,
+};
+
+// Identifies the subscriptions of the consumer below.
 #[derive(Debug)]
-struct Invoicing {
-    topic: String,
+enum OrderTopic {
+    Created,
+    Cancelled,
 }
+
+// A consumer subscribes to topic patterns and handles matching events per subscription.
+#[derive(Debug)]
+struct Invoicing;
 
 #[async_trait::async_trait]
 impl EventConsumer for Invoicing {
-    fn consumes(&self) -> &str {
-        &self.topic
+    type Topic = OrderTopic;
+
+    fn subscriptions(&self) -> Subscriptions<OrderTopic> {
+        Subscriptions::new()
+            .on(OrderTopic::Created, "orders.*.created")
+            .on(
+                OrderTopic::Cancelled,
+                Subscription::new("orders.*.cancelled")
+                    .with_retry_policy(RetryPolicy::exponential(3, Duration::from_millis(100))),
+            )
     }
 
-    async fn handle_event(&self, event: Arc<EventMessage>) -> anyhow::Result<()> {
-        println!("invoicing {}: {:?}", event.topic(), event.content());
+    async fn handle_event(
+        &self,
+        topic: &OrderTopic,
+        delivery: &Delivery,
+    ) -> Result<(), HandlerError> {
+        let order = std::str::from_utf8(delivery.message().content())?;
+        match topic {
+            OrderTopic::Created => println!("invoicing {order}"),
+            OrderTopic::Cancelled => println!("voiding the invoice of {order}"),
+        }
         Ok(())
     }
 }
@@ -70,9 +108,7 @@ impl EventEmitter for OrderService {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let broker = EventBroker::default();
-    broker.add_topic_consumer(Invoicing {
-        topic: "orders.*.created".to_string(),
-    })?;
+    broker.add_topic_consumer(Invoicing)?;
 
     let broker = broker.run()?;
     let orders = OrderService {
@@ -87,11 +123,52 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+Errors returned from `handle_event` are retried according to the subscription's `RetryPolicy`;
+return `HandlerError::permanent(error)` for errors retrying won't fix. Messages a subscription
+gives up on are handed to the `DeadLetterSink` set with `EventBroker::with_dead_letter_sink` or
+`Subscription::with_dead_letter_sink`, and logged and dropped without one.
+
+### Bridging other messaging systems
+
+A message received from another messaging system can carry the transport's handle. The broker
+settles it once, after every subscription the message was routed to finished, e.g. for NATS
+JetStream:
+
+```rust
+#[derive(Debug)]
+struct JetStreamHandle(async_nats::jetstream::Message);
+
+#[async_trait::async_trait]
+impl TransportHandle for JetStreamHandle {
+    async fn settle(&self, settlement: &Settlement) -> anyhow::Result<()> {
+        let kind = if settlement.all_handled() || settlement.is_unrouted() {
+            AckKind::Ack
+        } else if settlement.any(DeliveryOutcome::Aborted) {
+            AckKind::Nak(None)
+        } else {
+            AckKind::Term
+        };
+        Ok(self.0.ack_with(kind).await?)
+    }
+
+    // Keeps JetStream from redelivering while a subscription waits to retry.
+    async fn on_retry(&self, _attempt: u32, _delay: Duration) -> anyhow::Result<()> {
+        Ok(self.0.ack_with(AckKind::Progress).await?)
+    }
+}
+
+let message = EventMessage::new(js_message.subject.as_str(), js_message.payload.clone())?
+    .with_transport(JetStreamHandle(js_message));
+```
+
+Consumers and dead letter sinks get the handle back with `transport::<JetStreamHandle>()`.
+
 Complete, runnable scenarios live in [examples/](examples/):
 
 ```bash
-cargo run --example sensor_hub      # wildcard and selection patterns
-cargo run --example order_pipeline  # fan-out to multiple services
+cargo run --example sensor_hub        # wildcard and selection patterns
+cargo run --example order_pipeline    # fan-out to multiple services
+cargo run --example transport_bridge  # retries, dead letters and transport handles
 ```
 
 Benchmarks for topic parsing, subscription matching and end-to-end dispatch:
