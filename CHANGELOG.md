@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-09-14
+
+### 🚀 Features
+
+- [**breaking**] Let consumers subscribe to multiple topics and handle each topic individually
+- Deliver messages through a bounded inbox per subscription with configurable concurrency
+- Retry failed deliveries with fixed, linear or exponential backoff
+- Hand messages subscriptions give up on to dead letter sinks
+- Make the handling of full subscription inboxes configurable
+- Carry transport handles on event messages and settle them once per message
+
+### 🐛 Bug Fixes
+
+- Keep a panicking handler from preventing delivery to the remaining consumers
+
+### 🚜 Refactor
+
+- [**breaking**] Rename find_consumer to find_subscriptions and replace get_subscriptions with subscriptions
+
+### 📚 Documentation
+
+- Add example bridging an external message queue into the broker
+- Document multi-topic subscriptions, retries, dead letters and transport handles in the readme
+
+### ⚙️ Miscellaneous Tasks
+
+- Uodate changelog
+
 ## [0.2.0] - 2026-07-15
 
 ### 🚀 Features
