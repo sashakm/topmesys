@@ -9,10 +9,11 @@
 //!
 //! Run with: `cargo run --example sensor_hub`
 
-use std::sync::Arc;
-
 use tokio::sync::mpsc;
-use topmesys::{EventBroker, EventConsumer, EventEmitter, EventMessage, EventSubmission};
+use topmesys::{
+    Delivery, EventBroker, EventConsumer, EventEmitter, EventMessage, EventSubmission,
+    HandlerError, Subscriptions,
+};
 
 #[derive(Debug)]
 struct TemperatureAlert {
@@ -22,11 +23,14 @@ struct TemperatureAlert {
 
 #[async_trait::async_trait]
 impl EventConsumer for TemperatureAlert {
-    fn consumes(&self) -> &str {
-        &self.topic
+    type Topic = ();
+
+    fn subscriptions(&self) -> Subscriptions<()> {
+        self.topic.as_str().into()
     }
 
-    async fn handle_event(&self, event: Arc<EventMessage>) -> anyhow::Result<()> {
+    async fn handle_event(&self, _topic: &(), delivery: &Delivery) -> Result<(), HandlerError> {
+        let event = delivery.message();
         let reading: f32 = std::str::from_utf8(event.content())?.parse()?;
         if reading > self.threshold {
             println!(
@@ -46,11 +50,14 @@ struct FloorLogger {
 
 #[async_trait::async_trait]
 impl EventConsumer for FloorLogger {
-    fn consumes(&self) -> &str {
-        &self.topic
+    type Topic = ();
+
+    fn subscriptions(&self) -> Subscriptions<()> {
+        self.topic.as_str().into()
     }
 
-    async fn handle_event(&self, event: Arc<EventMessage>) -> anyhow::Result<()> {
+    async fn handle_event(&self, _topic: &(), delivery: &Delivery) -> Result<(), HandlerError> {
+        let event = delivery.message();
         println!(
             "[logger] {} = {}",
             event.topic(),

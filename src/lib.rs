@@ -1,13 +1,36 @@
-use std::{fmt::Display, marker::PhantomData, sync::Arc};
+use std::{
+    any::Any,
+    fmt::Display,
+    marker::PhantomData,
+    sync::{Arc, PoisonError},
+};
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::{StreamExt, future::select};
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinSet,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use type_states::{Init, Pattern, RoutingKey, Running, StateMarker, Stopped};
 
-pub type EventSubscriptions = Arc<DashMap<EventTopic<Pattern>, Vec<Arc<dyn EventConsumer>>>>;
+mod dead_letter;
+mod delivery;
+mod retry;
+mod subscription;
+mod transport;
+
+pub use dead_letter::{DeadLetter, DeadLetterReason, DeadLetterSink};
+pub use delivery::{Delivery, HandlerError};
+pub use retry::{Backoff, RetryPolicy};
+pub use subscription::{Overflow, Subscription, SubscriptionInfo, Subscriptions};
+pub use transport::{DeliveryOutcome, Settlement, SubscriptionOutcome, TransportHandle};
+
+use subscription::{Defaults, Inbox, Route, Subscriber};
+use transport::Settler;
+
+type EventSubscriptions = Arc<DashMap<EventTopic<Pattern>, Vec<Route>>>;
 
 /// Allows for a concise representation and implementation of the [EventBroker]s and the [EventTopic]s
 /// lifecycle modes
@@ -29,6 +52,8 @@ pub mod type_states {
         pub(super) message_tx: super::mpsc::Sender<super::EventMessage>,
         pub(super) stop_tx: super::watch::Sender<bool>,
         pub(super) handle: tokio::task::JoinHandle<()>,
+        pub(super) runtime: tokio::runtime::Handle,
+        pub(super) workers: std::sync::Mutex<super::JoinSet<()>>,
     }
 
     pub trait StateMarker {}
@@ -304,6 +329,7 @@ impl From<EventMessage> for EventSubmission {
     }
 }
 
+/// Clones the message, which leaves its [TransportHandle] behind.
 impl From<&EventMessage> for EventSubmission {
     fn from(value: &EventMessage) -> Self {
         Self::Single(value.clone())
@@ -342,28 +368,89 @@ pub trait EventEmitter: std::fmt::Debug {
     }
 }
 
-/// Implementors are registered with an [EventBroker] and receive [EventMessage]s based on [EventTopic]s.
+/// Implementors are registered with an [EventBroker] and receive [EventMessage]s on one or more
+/// [Subscriptions]. Every subscription pairs a topic pattern with a value of the consumer's
+/// [Topic](EventConsumer::Topic), which is handed to [handle_event](EventConsumer::handle_event)
+/// along with each [Delivery] it receives, so messages can be handled per subscription. A message
+/// matching several subscriptions of a consumer is delivered once on each of them.
+///
+/// Errors returned by the handler are retried according to the subscription's [RetryPolicy], and
+/// messages the subscription gives up on are handed to its [DeadLetterSink], see [HandlerError].
+/// #### Example
+/// ```
+/// use std::time::Duration;
+/// use topmesys::{Delivery, EventConsumer, HandlerError, RetryPolicy, Subscription, Subscriptions};
+///
+/// #[derive(Debug)]
+/// enum NoteTopic {
+///     Created,
+///     Archived,
+/// }
+///
+/// #[derive(Debug)]
+/// struct AuditLog;
+///
+/// #[async_trait::async_trait]
+/// impl EventConsumer for AuditLog {
+///     type Topic = NoteTopic;
+///
+///     fn subscriptions(&self) -> Subscriptions<NoteTopic> {
+///         Subscriptions::new()
+///             .on(NoteTopic::Created, "notes.*.created")
+///             .on(
+///                 NoteTopic::Archived,
+///                 Subscription::new("notes.*.archived")
+///                     .with_retry_policy(RetryPolicy::exponential(5, Duration::from_millis(100))),
+///             )
+///     }
+///
+///     async fn handle_event(
+///         &self,
+///         topic: &NoteTopic,
+///         delivery: &Delivery,
+///     ) -> Result<(), HandlerError> {
+///         let note = std::str::from_utf8(delivery.message().content())?;
+///         match topic {
+///             NoteTopic::Created => println!("created {note}"),
+///             NoteTopic::Archived => println!("archived {note}"),
+///         }
+///         Ok(())
+///     }
+/// }
+/// ```
 #[async_trait::async_trait]
-pub trait EventConsumer: std::fmt::Debug + Send + Sync {
-    fn consumes(&self) -> &str;
-    async fn handle_event(&self, event: Arc<EventMessage>) -> anyhow::Result<()>;
+pub trait EventConsumer: std::fmt::Debug + Send + Sync + 'static {
+    /// Identifies the consumer's subscriptions, typically an enum. Consumers with a single
+    /// subscription can use `()`.
+    type Topic: std::fmt::Debug + Send + Sync + 'static;
+
+    /// Called once, when the consumer is registered with a broker.
+    fn subscriptions(&self) -> Subscriptions<Self::Topic>;
+
+    async fn handle_event(
+        &self,
+        topic: &Self::Topic,
+        delivery: &Delivery,
+    ) -> Result<(), HandlerError>;
 }
 
-/// Identifies a single registration of an [EventConsumer] with an [EventBroker]. Returned by
+/// Identifies the subscriptions of an [EventConsumer] registered with an [EventBroker]. Returned by
 /// [add_topic_consumer](EventBroker::add_topic_consumer) and consumed by
 /// [remove_topic_consumer](EventBroker::remove_topic_consumer) to unsubscribe the consumer again.
-/// The handle holds a [Weak](std::sync::Weak) reference, so keeping it around does not keep the
+/// The handle holds [Weak](std::sync::Weak) references, so keeping it around does not keep the
 /// consumer alive.
 #[derive(Debug, Clone)]
 pub struct SubscriptionHandle {
-    pattern: EventTopic<Pattern>,
-    consumer: std::sync::Weak<dyn EventConsumer>,
+    subscriptions: Vec<(EventTopic<Pattern>, std::sync::Weak<Subscriber>)>,
 }
 
-/// This is the central bus for all events in the application. It sets up a [channel](tokio::sync::mpsc) and dispatches
-/// received [EventMessage]s to [EventConsumer]s subscribed to matching [EventTopic]s by calling the consumers [handle_event](EventConsumer::handle_event)
-/// method. If an events topic can't be matched to any subscribed consumers, the message will be dropped silently. If the consumers event handling method returns
-/// an error, the error is logged and the event discarded. Future development will expand this behavior with proper routing policies and error handling.
+/// This is the central bus for all events in the application. It sets up a [channel](tokio::sync::mpsc) and routes
+/// received [EventMessage]s to the [Subscription]s of [EventConsumer]s with matching topic patterns. Every subscription
+/// has its own bounded inbox and worker, which calls the consumer's [handle_event](EventConsumer::handle_event) method,
+/// retries failed deliveries according to the subscription's [RetryPolicy] and hands messages it gives up on to a
+/// [DeadLetterSink]. When an inbox is full, the subscription's [Overflow] policy decides whether routing waits or the
+/// message is dead-lettered. Messages whose topic doesn't match any subscription are dropped silently, and messages
+/// carrying a [TransportHandle] are settled once all of their deliveries finished.
 /// Messages are submitted to the channel using a [Sender<EventMessage>], produced by the [get_sender](EventBroker::get_sender) method.
 /// While the sender can be used for submissions "as is", the [submit_event][EventEmitter::submit_event] from the [EventEmitter] trait provides a safe default
 /// implementation using [channel permits](tokio::sync::mpsc::Permit), conveniently supporting both single and batched [EventSubmission]s.
@@ -372,6 +459,7 @@ pub struct EventBroker<S: StateMarker> {
     runtime: S,
     subscriptions: EventSubscriptions,
     handle_ctrl_c: bool,
+    defaults: Defaults,
 }
 
 impl Default for EventBroker<Stopped> {
@@ -386,6 +474,7 @@ impl EventBroker<()> {
             runtime: Stopped { bufsize },
             subscriptions: Arc::new(DashMap::new()),
             handle_ctrl_c: false,
+            defaults: Defaults::default(),
         }
     }
 }
@@ -394,52 +483,79 @@ impl<S> EventBroker<S>
 where
     S: StateMarker + 'static,
 {
-    pub fn add_topic_consumer(
+    fn register(
         &self,
-        consumer: impl EventConsumer + 'static,
-    ) -> Result<SubscriptionHandle, TopicError> {
-        let subscription_pattern = EventTopic::new(consumer.consumes()).as_subscription()?;
-        let consumer: Arc<dyn EventConsumer> = Arc::new(consumer);
-        let handle = SubscriptionHandle {
-            pattern: subscription_pattern.clone(),
-            consumer: Arc::downgrade(&consumer),
+        subscribers: Vec<Arc<Subscriber>>,
+        mut open: impl FnMut(&Arc<Subscriber>) -> Option<Inbox>,
+    ) -> SubscriptionHandle {
+        let mut handle = SubscriptionHandle {
+            subscriptions: Vec::with_capacity(subscribers.len()),
         };
-        self.subscriptions
-            .entry(subscription_pattern)
-            .or_default()
-            .push(consumer);
-        Ok(handle)
+        for subscriber in subscribers {
+            let pattern = subscriber.info.pattern().clone();
+            handle
+                .subscriptions
+                .push((pattern.clone(), Arc::downgrade(&subscriber)));
+            let inbox = open(&subscriber);
+            self.subscriptions
+                .entry(pattern)
+                .or_default()
+                .push(Route { subscriber, inbox });
+        }
+        handle
     }
 
-    /// Removes the consumer registration identified by the given [SubscriptionHandle]. Returns
-    /// `true` if the consumer was found and removed, `false` if it was removed before.
+    /// Removes the subscriptions identified by the given [SubscriptionHandle]. Messages already queued
+    /// for them are still handled. Returns `true` if any subscription was found and removed, `false`
+    /// if they were removed before.
     pub fn remove_topic_consumer(&self, handle: SubscriptionHandle) -> bool {
-        let Some(consumer) = handle.consumer.upgrade() else {
-            return false;
-        };
-        let removed = match self.subscriptions.get_mut(&handle.pattern) {
-            Some(mut consumers) => {
-                let before = consumers.len();
-                consumers.retain(|candidate| !Arc::ptr_eq(candidate, &consumer));
-                consumers.len() < before
+        let mut removed = false;
+        for (pattern, subscriber) in handle.subscriptions {
+            let Some(subscriber) = subscriber.upgrade() else {
+                continue;
+            };
+            if let Some(mut routes) = self.subscriptions.get_mut(&pattern) {
+                let before = routes.len();
+                routes.retain(|route| !Arc::ptr_eq(&route.subscriber, &subscriber));
+                removed |= routes.len() < before;
             }
-            None => false,
-        };
-        self.subscriptions
-            .remove_if(&handle.pattern, |_, consumers| consumers.is_empty());
+            self.subscriptions
+                .remove_if(&pattern, |_, routes| routes.is_empty());
+        }
         removed
     }
 
-    pub fn get_subscriptions(&self) -> &EventSubscriptions {
-        &self.subscriptions
-    }
-
-    pub fn find_consumer(&self, topic: &EventTopic<RoutingKey>) -> Vec<Arc<dyn EventConsumer>> {
+    /// All subscriptions registered with the broker.
+    pub fn subscriptions(&self) -> Vec<Arc<SubscriptionInfo>> {
         self.subscriptions
             .iter()
-            .filter(|entry| entry.key().match_topic(topic))
-            .flat_map(|entry| entry.value().clone())
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .map(|route| route.subscriber.info.clone())
+                    .collect::<Vec<_>>()
+            })
             .collect()
+    }
+
+    /// The subscriptions a message with the given topic is delivered to.
+    pub fn find_subscriptions(&self, topic: &EventTopic<RoutingKey>) -> Vec<Arc<SubscriptionInfo>> {
+        self.matching_routes(topic, |route| Some(route.subscriber.info.clone()))
+    }
+
+    fn matching_routes<T>(
+        &self,
+        topic: &EventTopic<RoutingKey>,
+        pick: impl Fn(&Route) -> Option<T>,
+    ) -> Vec<T> {
+        let mut picked = Vec::new();
+        for entry in self.subscriptions.iter() {
+            if entry.key().match_topic(topic) {
+                picked.extend(entry.value().iter().filter_map(&pick));
+            }
+        }
+        picked
     }
 
     #[tracing::instrument(skip(self))]
@@ -462,7 +578,7 @@ where
         let stop_call = stop_rx.changed();
         let mut stop = select(Box::pin(stop_signal), Box::pin(stop_call));
         let mut event_stream = ReceiverStream::new(receiver);
-        let mut handlers = tokio::task::JoinSet::new();
+        let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
                 biased;
@@ -471,18 +587,13 @@ where
                     event_stream.close();
                     break;
                 }
-                Some(result) = handlers.join_next(), if !handlers.is_empty() => {
+                Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                     if let Err(e) = result {
-                        tracing::error!("Event handler task failed: {e}");
+                        tracing::error!("Event dispatch task failed: {e}");
                     }
                 }
                 maybe_msg = event_stream.next() => match maybe_msg {
-                    Some(event_msg) => {
-                        handlers.spawn(Self::publish_event(
-                            self.find_consumer(event_msg.topic()),
-                            Arc::new(event_msg),
-                        ));
-                    }
+                    Some(event_msg) => self.dispatch(event_msg, &mut tasks).await,
                     None => {
                         tracing::info!("Event loop processing ended. Shutting down broker.");
                         break;
@@ -490,27 +601,55 @@ where
                 },
             }
         }
-        // Drain events still buffered in the channel, then wait for all in-flight handlers,
-        // so no accepted message is lost and none is still being processed after `stop` returns.
+        // Route events still buffered in the channel, then close the inboxes, so every subscription
+        // finishes once it processed its queued deliveries and no accepted message is lost.
         while let Some(event_msg) = event_stream.next().await {
-            handlers.spawn(Self::publish_event(
-                self.find_consumer(event_msg.topic()),
-                Arc::new(event_msg),
-            ));
+            self.dispatch(event_msg, &mut tasks).await;
         }
-        while let Some(result) = handlers.join_next().await {
+        close_inboxes(&self.subscriptions);
+        while let Some(result) = tasks.join_next().await {
             if let Err(e) = result {
-                tracing::error!("Event handler task failed: {e}");
+                tracing::error!("Event dispatch task failed: {e}");
             }
         }
     }
 
-    #[tracing::instrument()]
-    async fn publish_event(consumers: Vec<Arc<dyn EventConsumer>>, event_msg: Arc<EventMessage>) {
-        for consumer in consumers {
-            if let Err(e) = consumer.handle_event(event_msg.clone()).await {
-                tracing::error!("{}", e.to_string())
+    /// Queues a delivery of the message in the inbox of every matching subscription.
+    async fn dispatch(&self, event_msg: EventMessage, tasks: &mut JoinSet<()>) {
+        let inboxes = self.matching_routes(event_msg.topic(), |route| route.inbox.clone());
+        let message = Arc::new(event_msg);
+        let settler = Settler::new(&message, inboxes.len());
+        let Some(last) = inboxes.len().checked_sub(1) else {
+            if let Some(settler) = settler {
+                tasks.spawn(settler.settle());
             }
+            return;
+        };
+        let mut settler = settler.map(Arc::new);
+        for (index, inbox) in inboxes.into_iter().enumerate() {
+            // The last delivery takes over the dispatcher's reference, so only deliveries hold the
+            // settler and the one finishing last settles the message.
+            let shared_settler = if index == last {
+                settler.take()
+            } else {
+                settler.clone()
+            };
+            let delivery = Delivery {
+                message: message.clone(),
+                subscription: inbox.subscription().clone(),
+                attempt: 1,
+                settler: shared_settler,
+            };
+            inbox.deliver(delivery, tasks).await;
+        }
+    }
+}
+
+/// Drops the broker's inbox senders, so every subscription worker finishes once its inbox is empty.
+fn close_inboxes(subscriptions: &EventSubscriptions) {
+    for mut routes in subscriptions.iter_mut() {
+        for route in routes.iter_mut() {
+            route.inbox = None;
         }
     }
 }
@@ -524,17 +663,53 @@ impl EventBroker<Stopped> {
         self
     }
 
+    /// Sets the retry policy of subscriptions that don't configure their own. Defaults to
+    /// [RetryPolicy::none].
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.defaults.retry_policy = policy;
+        self
+    }
+
+    /// Sets the dead letter sink of subscriptions that don't configure their own. Without a sink,
+    /// messages subscriptions give up on are logged and dropped.
+    pub fn with_dead_letter_sink(mut self, sink: Arc<dyn DeadLetterSink>) -> Self {
+        self.defaults.dead_letter_sink = Some(sink);
+        self
+    }
+
+    /// Registers the consumer's subscriptions, which receive messages once the broker runs.
+    pub fn add_topic_consumer(
+        &self,
+        consumer: impl EventConsumer,
+    ) -> Result<SubscriptionHandle, TopicError> {
+        Ok(self.register(Subscriber::from_consumer(consumer)?, |_| None))
+    }
+
     pub fn run(self) -> Result<EventBroker<Running>, BrokerError> {
         let rt = tokio::runtime::Handle::try_current()?;
         let (message_tx, message_rx) = mpsc::channel::<EventMessage>(self.runtime.bufsize);
         let (stop_tx, stop_rx) = watch::channel(false);
+        let mut workers = JoinSet::new();
+        for mut routes in self.subscriptions.iter_mut() {
+            for route in routes.iter_mut() {
+                route.inbox = Some(route.subscriber.open(
+                    self.runtime.bufsize,
+                    &self.defaults,
+                    &mut workers,
+                    &rt,
+                ));
+            }
+        }
         let broker = EventBroker {
             subscriptions: self.subscriptions.clone(),
             handle_ctrl_c: self.handle_ctrl_c,
+            defaults: self.defaults.clone(),
             runtime: Running {
                 handle: rt.spawn(async move { self.run_event_loop(message_rx, stop_rx).await }),
                 message_tx,
                 stop_tx,
+                runtime: rt,
+                workers: std::sync::Mutex::new(workers),
             },
         };
 
@@ -543,6 +718,36 @@ impl EventBroker<Stopped> {
 }
 
 impl EventBroker<Running> {
+    /// Registers the consumer's subscriptions, which receive messages right away.
+    pub fn add_topic_consumer(
+        &self,
+        consumer: impl EventConsumer,
+    ) -> Result<SubscriptionHandle, TopicError> {
+        let subscribers = Subscriber::from_consumer(consumer)?;
+        let mut workers = self
+            .runtime
+            .workers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Clean up after the workers of removed subscriptions.
+        while let Some(result) = workers.try_join_next() {
+            if let Err(e) = result {
+                tracing::error!("Subscription worker failed: {e}");
+            }
+        }
+        let inbox_capacity = self.runtime.message_tx.max_capacity();
+        Ok(self.register(subscribers, |subscriber| {
+            Some(subscriber.open(
+                inbox_capacity,
+                &self.defaults,
+                &mut workers,
+                &self.runtime.runtime,
+            ))
+        }))
+    }
+
+    /// Stops the broker once every accepted message was handled, dead-lettered or dropped, including
+    /// deliveries still waiting for a retry.
     pub async fn stop(self) -> EventBroker<Stopped> {
         match self.runtime.stop_tx.send(true) {
             Err(e) => {
@@ -555,12 +760,25 @@ impl EventBroker<Running> {
                 }
             }
         }
+        // Subscriptions added after the event loop ended still have open inboxes.
+        close_inboxes(&self.subscriptions);
+        let mut workers = self
+            .runtime
+            .workers
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        while let Some(result) = workers.join_next().await {
+            if let Err(e) = result {
+                tracing::error!("Subscription worker failed: {e}");
+            }
+        }
         EventBroker {
             runtime: Stopped {
                 bufsize: self.runtime.message_tx.max_capacity(),
             },
             subscriptions: self.subscriptions.clone(),
             handle_ctrl_c: self.handle_ctrl_c,
+            defaults: self.defaults,
         }
     }
 
@@ -571,6 +789,10 @@ impl EventBroker<Running> {
 
 /// A type representing an event handled by the applications event bus, consisting
 /// of a [Into] [String] subject and [Into] [Bytes] content.
+///
+/// Messages received from another messaging system can additionally carry a [TransportHandle],
+/// which the broker settles once the message was delivered. Clones and comparisons only take topic
+/// and content into account: a clone leaves the handle behind, so only the original settles it.
 /// #### Example
 /// ```
 /// use topmesys::{EventMessage, EventTopic};
@@ -585,11 +807,30 @@ impl EventBroker<Running> {
 /// assert_eq!(first_msg.topic(), second_msg.topic());
 /// assert_eq!(first_msg.content(), second_msg.content());
 /// ```
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct EventMessage {
     topic: EventTopic<RoutingKey>,
     content: Bytes,
+    transport: Option<Box<dyn TransportHandle>>,
 }
+
+impl Clone for EventMessage {
+    fn clone(&self) -> Self {
+        Self {
+            topic: self.topic.clone(),
+            content: self.content.clone(),
+            transport: None,
+        }
+    }
+}
+
+impl PartialEq for EventMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.topic == other.topic && self.content == other.content
+    }
+}
+
+impl Eq for EventMessage {}
 
 impl EventMessage {
     pub fn new(
@@ -599,6 +840,7 @@ impl EventMessage {
         Ok(Self {
             topic: EventTopic::new(topic_text.into()).as_routing_key()?,
             content: content.into(),
+            transport: None,
         })
     }
 
@@ -608,6 +850,17 @@ impl EventMessage {
 
     pub fn content(&self) -> &Bytes {
         &self.content
+    }
+
+    /// The message's transport handle, if it carries one of type `T`.
+    pub fn transport<T: TransportHandle>(&self) -> Option<&T> {
+        let handle: &dyn Any = self.transport.as_deref()?;
+        handle.downcast_ref()
+    }
+
+    /// The message's transport handle, regardless of its type.
+    pub fn transport_handle(&self) -> Option<&dyn TransportHandle> {
+        self.transport.as_deref()
     }
 
     /// Self-consuming topic setter
@@ -621,19 +874,161 @@ impl EventMessage {
         self.content = content.into();
         self
     }
+
+    /// Self-consuming transport handle setter
+    pub fn with_transport(mut self, handle: impl TransportHandle) -> Self {
+        self.transport = Some(Box::new(handle));
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{ops::Deref, sync::Arc};
+    use std::{
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use dashmap::DashMap;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Semaphore, mpsc};
 
     use super::{
-        EventBroker, EventConsumer, EventEmitter, EventMessage, EventSubmission, EventTopic,
-        TopicSegment,
+        DeadLetter, DeadLetterReason, DeadLetterSink, Delivery, DeliveryOutcome, EventBroker,
+        EventConsumer, EventEmitter, EventMessage, EventSubmission, EventTopic, HandlerError,
+        Overflow, RetryPolicy, Settlement, Subscription, Subscriptions, TopicSegment,
+        TransportHandle,
     };
+
+    /// A call of a [ScriptedConsumer]'s handler.
+    #[derive(Debug, Clone)]
+    struct Call {
+        content: String,
+        attempt: u32,
+        transport: Option<&'static str>,
+    }
+
+    type Calls = Arc<Mutex<Vec<Call>>>;
+
+    #[derive(Debug, Clone, Copy)]
+    enum Script {
+        Succeed,
+        FailAttempts(u32),
+        FailPermanently,
+        Panic,
+    }
+
+    /// Consumer following a [Script] and recording every call of its handler.
+    #[derive(Debug)]
+    struct ScriptedConsumer {
+        subscription: Subscription,
+        script: Script,
+        calls: Calls,
+    }
+
+    impl ScriptedConsumer {
+        fn new(subscription: impl Into<Subscription>, script: Script) -> (Self, Calls) {
+            let calls = Calls::default();
+            let consumer = Self {
+                subscription: subscription.into(),
+                script,
+                calls: calls.clone(),
+            };
+            (consumer, calls)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventConsumer for ScriptedConsumer {
+        type Topic = ();
+
+        fn subscriptions(&self) -> Subscriptions<()> {
+            self.subscription.clone().into()
+        }
+
+        async fn handle_event(&self, _topic: &(), delivery: &Delivery) -> Result<(), HandlerError> {
+            let call = Call {
+                content: String::from_utf8(delivery.message().content().to_vec())?,
+                attempt: delivery.attempt(),
+                transport: delivery
+                    .transport::<RecordingHandle>()
+                    .map(|handle| handle.id),
+            };
+            self.calls.lock().unwrap().push(call);
+            match self.script {
+                Script::FailAttempts(failing) if delivery.attempt() <= failing => {
+                    Err(anyhow::anyhow!("attempt {} failed", delivery.attempt()).into())
+                }
+                Script::Succeed | Script::FailAttempts(_) => Ok(()),
+                Script::FailPermanently => Err(HandlerError::permanent(anyhow::anyhow!(
+                    "malformed payload"
+                ))),
+                Script::Panic => panic!("handler bug"),
+            }
+        }
+    }
+
+    type Settlements = Arc<Mutex<Vec<(&'static str, Settlement)>>>;
+
+    /// Transport handle recording its settlement and retry notifications.
+    #[derive(Debug)]
+    struct RecordingHandle {
+        id: &'static str,
+        settlements: Settlements,
+        retries: Arc<AtomicUsize>,
+    }
+
+    impl RecordingHandle {
+        fn new(id: &'static str, settlements: &Settlements, retries: &Arc<AtomicUsize>) -> Self {
+            Self {
+                id,
+                settlements: settlements.clone(),
+                retries: retries.clone(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TransportHandle for RecordingHandle {
+        async fn settle(&self, settlement: &Settlement) -> anyhow::Result<()> {
+            self.settlements
+                .lock()
+                .unwrap()
+                .push((self.id, settlement.clone()));
+            Ok(())
+        }
+
+        async fn on_retry(&self, _attempt: u32, _delay: Duration) -> anyhow::Result<()> {
+            self.retries.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Dead letter sink keeping every letter it receives.
+    #[derive(Debug, Default)]
+    struct CollectingSink {
+        letters: Mutex<Vec<DeadLetter>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DeadLetterSink for CollectingSink {
+        async fn dead_letter(&self, letter: DeadLetter) -> anyhow::Result<()> {
+            self.letters.lock().unwrap().push(letter);
+            Ok(())
+        }
+    }
+
+    async fn wait_until(condition: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("condition was not met in time");
+    }
 
     #[test]
     fn test_event_submission() {
@@ -869,15 +1264,21 @@ mod tests {
 
         #[async_trait::async_trait]
         impl EventConsumer for TestConsumer {
-            fn consumes(&self) -> &str {
-                &self.topic
+            type Topic = ();
+
+            fn subscriptions(&self) -> Subscriptions<()> {
+                self.topic.as_str().into()
             }
 
-            async fn handle_event(&self, event: Arc<EventMessage>) -> anyhow::Result<()> {
+            async fn handle_event(
+                &self,
+                _topic: &(),
+                delivery: &Delivery,
+            ) -> Result<(), HandlerError> {
                 self.results
                     .entry(self.name.clone())
                     .or_default()
-                    .push(event.deref().clone());
+                    .push(delivery.message().as_ref().clone());
                 Ok(())
             }
         }
@@ -956,7 +1357,6 @@ mod tests {
 
         let _ = broker.stop().await;
 
-        println!("{consumer_results:#?}");
         let consumer_messages = consumer_results.get("consumer").unwrap();
         let consumer2_messages = consumer_results.get("consumer2").unwrap();
         let consumer3_messages = consumer_results.get("consumer3").unwrap();
@@ -989,11 +1389,17 @@ mod tests {
 
         #[async_trait::async_trait]
         impl EventConsumer for NoopConsumer {
-            fn consumes(&self) -> &str {
-                "test.remove"
+            type Topic = ();
+
+            fn subscriptions(&self) -> Subscriptions<()> {
+                "test.remove".into()
             }
 
-            async fn handle_event(&self, _event: Arc<EventMessage>) -> anyhow::Result<()> {
+            async fn handle_event(
+                &self,
+                _topic: &(),
+                _delivery: &Delivery,
+            ) -> Result<(), HandlerError> {
                 Ok(())
             }
         }
@@ -1001,12 +1407,39 @@ mod tests {
         let broker = EventBroker::new(1);
         let handle = broker.add_topic_consumer(NoopConsumer).unwrap();
         let routing_key = EventTopic::new("test.remove").as_routing_key().unwrap();
-        assert_eq!(broker.find_consumer(&routing_key).len(), 1);
+        assert_eq!(broker.find_subscriptions(&routing_key).len(), 1);
 
         assert!(broker.remove_topic_consumer(handle.clone()));
-        assert!(broker.find_consumer(&routing_key).is_empty());
-        assert!(broker.get_subscriptions().is_empty());
+        assert!(broker.find_subscriptions(&routing_key).is_empty());
+        assert!(broker.subscriptions().is_empty());
         assert!(!broker.remove_topic_consumer(handle));
+    }
+
+    #[test]
+    fn test_consumer_with_invalid_pattern_is_not_registered() {
+        #[derive(Debug)]
+        struct PartlyValid;
+
+        #[async_trait::async_trait]
+        impl EventConsumer for PartlyValid {
+            type Topic = u8;
+
+            fn subscriptions(&self) -> Subscriptions<u8> {
+                Subscriptions::new().on(1, "valid.*").on(2, "not valid")
+            }
+
+            async fn handle_event(
+                &self,
+                _topic: &u8,
+                _delivery: &Delivery,
+            ) -> Result<(), HandlerError> {
+                Ok(())
+            }
+        }
+
+        let broker = EventBroker::new(1);
+        assert!(broker.add_topic_consumer(PartlyValid).is_err());
+        assert!(broker.subscriptions().is_empty());
     }
 
     #[tokio::test]
@@ -1018,16 +1451,22 @@ mod tests {
 
         #[async_trait::async_trait]
         impl EventConsumer for SlowConsumer {
-            fn consumes(&self) -> &str {
-                "slow.*"
+            type Topic = ();
+
+            fn subscriptions(&self) -> Subscriptions<()> {
+                "slow.*".into()
             }
 
-            async fn handle_event(&self, event: Arc<EventMessage>) -> anyhow::Result<()> {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            async fn handle_event(
+                &self,
+                _topic: &(),
+                delivery: &Delivery,
+            ) -> Result<(), HandlerError> {
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 self.results
                     .entry("slow".to_string())
                     .or_default()
-                    .push(event.deref().clone());
+                    .push(delivery.message().as_ref().clone());
                 Ok(())
             }
         }
@@ -1069,5 +1508,434 @@ mod tests {
         let _ = broker.stop().await;
 
         assert_eq!(results.get("slow").map(|v| v.len()), Some(events.len()));
+    }
+
+    #[tokio::test]
+    async fn test_multi_topic_consumer_handles_topics_individually() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum ShopTopic {
+            Orders,
+            EuPayments,
+        }
+
+        #[derive(Debug, Default)]
+        struct Shop {
+            received: Arc<Mutex<Vec<(ShopTopic, String)>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl EventConsumer for Shop {
+            type Topic = ShopTopic;
+
+            fn subscriptions(&self) -> Subscriptions<ShopTopic> {
+                Subscriptions::new()
+                    .on(ShopTopic::Orders, "orders.*")
+                    .on(ShopTopic::EuPayments, "[orders,payments].eu.*")
+            }
+
+            async fn handle_event(
+                &self,
+                topic: &ShopTopic,
+                delivery: &Delivery,
+            ) -> Result<(), HandlerError> {
+                let routing_key = delivery.message().topic().text().to_string();
+                self.received.lock().unwrap().push((*topic, routing_key));
+                Ok(())
+            }
+        }
+
+        let shop = Shop::default();
+        let received = shop.received.clone();
+
+        // Consumers can be called without a broker.
+        let delivery = Delivery::new(
+            EventMessage::new("orders.test", "").unwrap(),
+            EventTopic::new("orders.*").as_subscription().unwrap(),
+        );
+        shop.handle_event(&ShopTopic::Orders, &delivery)
+            .await
+            .unwrap();
+        assert_eq!(received.lock().unwrap().len(), 1);
+        received.lock().unwrap().clear();
+
+        let broker = EventBroker::new(8).run().unwrap();
+        let handle = broker.add_topic_consumer(shop).unwrap();
+        let routed = broker.find_subscriptions(
+            &EventTopic::new("orders.eu.created")
+                .as_routing_key()
+                .unwrap(),
+        );
+        assert_eq!(routed.len(), 2);
+        assert!(routed.iter().all(|info| info.consumer().ends_with("Shop")));
+
+        for topic in [
+            "orders.us.created",
+            "orders.eu.created",
+            "payments.eu.settled",
+            "payments.us.settled",
+        ] {
+            broker
+                .get_sender()
+                .send(EventMessage::new(topic, "").unwrap())
+                .await
+                .unwrap();
+        }
+        let broker = broker.stop().await;
+
+        let mut received = received.lock().unwrap().clone();
+        received.sort();
+        assert_eq!(
+            received,
+            [
+                (ShopTopic::Orders, "orders.eu.created".to_string()),
+                (ShopTopic::Orders, "orders.us.created".to_string()),
+                (ShopTopic::EuPayments, "orders.eu.created".to_string()),
+                (ShopTopic::EuPayments, "payments.eu.settled".to_string()),
+            ]
+        );
+
+        assert!(broker.remove_topic_consumer(handle));
+        assert!(broker.subscriptions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_retries_until_handled_and_settles_once() {
+        let settlements = Settlements::default();
+        let retries = Arc::new(AtomicUsize::new(0));
+        let (consumer, calls) = ScriptedConsumer::new(
+            Subscription::new("jobs.*")
+                .with_retry_policy(RetryPolicy::fixed(3, Duration::from_millis(1))),
+            Script::FailAttempts(2),
+        );
+        let broker = EventBroker::new(4).run().unwrap();
+        broker.add_topic_consumer(consumer).unwrap();
+
+        let message = EventMessage::new("jobs.render", "job")
+            .unwrap()
+            .with_transport(RecordingHandle::new("job", &settlements, &retries));
+        broker.get_sender().send(message).await.unwrap();
+        let _ = broker.stop().await;
+
+        let attempts = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| (call.attempt, call.transport))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempts,
+            [(1, Some("job")), (2, Some("job")), (3, Some("job"))]
+        );
+        assert_eq!(retries.load(Ordering::SeqCst), 2);
+        let settlements = settlements.lock().unwrap();
+        assert_eq!(settlements.len(), 1);
+        assert!(settlements[0].1.all_handled());
+    }
+
+    #[tokio::test]
+    async fn test_settlement_reports_every_subscription() {
+        #[derive(Debug)]
+        struct FailingSink;
+
+        #[async_trait::async_trait]
+        impl DeadLetterSink for FailingSink {
+            async fn dead_letter(&self, _letter: DeadLetter) -> anyhow::Result<()> {
+                anyhow::bail!("dead letter queue unavailable")
+            }
+        }
+
+        let settlements = Settlements::default();
+        let retries = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::new(CollectingSink::default());
+        let broker = EventBroker::new(4)
+            .with_dead_letter_sink(sink.clone())
+            .run()
+            .unwrap();
+        let consumers = [
+            ScriptedConsumer::new("orders.*", Script::Succeed),
+            ScriptedConsumer::new("orders.eu.*", Script::FailPermanently),
+            ScriptedConsumer::new(
+                Subscription::new("orders.[eu,us].created")
+                    .with_dead_letter_sink(Arc::new(FailingSink)),
+                Script::FailPermanently,
+            ),
+        ];
+        for (consumer, _) in consumers {
+            broker.add_topic_consumer(consumer).unwrap();
+        }
+
+        let sender = broker.get_sender();
+        let routed = EventMessage::new("orders.eu.created", "{}")
+            .unwrap()
+            .with_transport(RecordingHandle::new("routed", &settlements, &retries));
+        let unrouted = EventMessage::new("invoices.created", "{}")
+            .unwrap()
+            .with_transport(RecordingHandle::new("unrouted", &settlements, &retries));
+        sender.send(routed).await.unwrap();
+        sender.send(unrouted).await.unwrap();
+        let _ = broker.stop().await;
+
+        let mut settlements = settlements.lock().unwrap().clone();
+        settlements.sort_by_key(|(id, _)| *id);
+        let [("routed", routed), ("unrouted", unrouted)] = settlements.as_slice() else {
+            panic!("expected one settlement per message, got {settlements:?}");
+        };
+        let mut outcomes = routed
+            .outcomes()
+            .iter()
+            .map(|outcome| (outcome.subscription().pattern().text(), outcome.outcome()))
+            .collect::<Vec<_>>();
+        outcomes.sort_by_key(|(pattern, _)| *pattern);
+        assert_eq!(
+            outcomes,
+            [
+                ("orders.*", DeliveryOutcome::Handled),
+                ("orders.[eu,us].created", DeliveryOutcome::Failed),
+                ("orders.eu.*", DeliveryOutcome::DeadLettered),
+            ]
+        );
+        assert!(!routed.all_handled() && !routed.any(DeliveryOutcome::Aborted));
+        assert!(unrouted.is_unrouted() && !unrouted.all_handled());
+        assert_eq!(retries.load(Ordering::SeqCst), 0);
+
+        let letters = sink.letters.lock().unwrap();
+        let [letter] = letters.as_slice() else {
+            panic!("expected one dead letter, got {letters:?}");
+        };
+        assert_eq!(letter.subscription().pattern().text(), "orders.eu.*");
+        assert_eq!(letter.attempts(), 1);
+        assert_eq!(
+            letter
+                .message()
+                .transport::<RecordingHandle>()
+                .map(|handle| handle.id),
+            Some("routed")
+        );
+        assert!(
+            matches!(letter.reason(), DeadLetterReason::HandlerFailed(error) if error.is_permanent())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_deliveries_are_dead_lettered() {
+        let sink = Arc::new(CollectingSink::default());
+        let broker = EventBroker::new(4)
+            .with_retry_policy(RetryPolicy::linear(
+                2,
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+            ))
+            .with_dead_letter_sink(sink.clone());
+        let consumers = [
+            ScriptedConsumer::new("flaky.*", Script::FailAttempts(u32::MAX)),
+            ScriptedConsumer::new("broken.*", Script::FailPermanently),
+            ScriptedConsumer::new("buggy.*", Script::Panic),
+            ScriptedConsumer::new(
+                Subscription::new("stubborn.*")
+                    .with_retry_policy(RetryPolicy::exponential(4, Duration::from_millis(1))),
+                Script::FailAttempts(u32::MAX),
+            ),
+        ];
+        for (consumer, _) in consumers {
+            broker.add_topic_consumer(consumer).unwrap();
+        }
+        let broker = broker.run().unwrap();
+
+        for topic in ["flaky.job", "broken.job", "buggy.job", "stubborn.job"] {
+            broker
+                .get_sender()
+                .send(EventMessage::new(topic, "job").unwrap())
+                .await
+                .unwrap();
+        }
+        let _ = broker.stop().await;
+
+        let mut letters = sink
+            .letters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|letter| {
+                let DeadLetterReason::HandlerFailed(error) = letter.reason() else {
+                    panic!("unexpected dead letter reason: {}", letter.reason());
+                };
+                (
+                    letter.subscription().pattern().text().to_string(),
+                    letter.attempts(),
+                    error.is_permanent(),
+                    error.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        letters.sort();
+        assert_eq!(
+            letters,
+            [
+                (
+                    "broken.*".to_string(),
+                    1,
+                    true,
+                    "malformed payload".to_string()
+                ),
+                (
+                    "buggy.*".to_string(),
+                    1,
+                    true,
+                    "event handler panicked: handler bug".to_string()
+                ),
+                (
+                    "flaky.*".to_string(),
+                    3,
+                    false,
+                    "attempt 3 failed".to_string()
+                ),
+                (
+                    "stubborn.*".to_string(),
+                    5,
+                    false,
+                    "attempt 5 failed".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sequential_subscription_retries_in_order() {
+        let (consumer, calls) = ScriptedConsumer::new(
+            Subscription::new("sequence.*")
+                .with_concurrency(1)
+                .with_retry_policy(RetryPolicy::fixed(1, Duration::from_millis(2))),
+            Script::FailAttempts(1),
+        );
+        let broker = EventBroker::new(8);
+        broker.add_topic_consumer(consumer).unwrap();
+        let broker = broker.run().unwrap();
+
+        for step in 0..4 {
+            broker
+                .get_sender()
+                .send(EventMessage::new("sequence.step", step.to_string()).unwrap())
+                .await
+                .unwrap();
+        }
+        let _ = broker.stop().await;
+
+        let calls = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| (call.content.clone(), call.attempt))
+            .collect::<Vec<_>>();
+        let expected = (0..4)
+            .flat_map(|step| [(step.to_string(), 1), (step.to_string(), 2)])
+            .collect::<Vec<_>>();
+        assert_eq!(calls, expected);
+    }
+
+    #[tokio::test]
+    async fn test_overflowing_inbox_is_dead_lettered() {
+        #[derive(Debug)]
+        struct GatedConsumer {
+            gate: Arc<Semaphore>,
+            handled: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl EventConsumer for GatedConsumer {
+            type Topic = ();
+
+            fn subscriptions(&self) -> Subscriptions<()> {
+                Subscription::new("gated.*")
+                    .with_inbox_capacity(1)
+                    .with_concurrency(1)
+                    .with_overflow(Overflow::DeadLetter)
+                    .into()
+            }
+
+            async fn handle_event(
+                &self,
+                _topic: &(),
+                _delivery: &Delivery,
+            ) -> Result<(), HandlerError> {
+                self.gate.acquire().await?.forget();
+                self.handled.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let gate = Arc::new(Semaphore::new(0));
+        let handled = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::new(CollectingSink::default());
+        let broker = EventBroker::new(8)
+            .with_dead_letter_sink(sink.clone())
+            .run()
+            .unwrap();
+        broker
+            .add_topic_consumer(GatedConsumer {
+                gate: gate.clone(),
+                handled: handled.clone(),
+            })
+            .unwrap();
+
+        for job in 0..4 {
+            broker
+                .get_sender()
+                .send(EventMessage::new("gated.job", job.to_string()).unwrap())
+                .await
+                .unwrap();
+        }
+        // While the handler is blocked, the subscription holds one message in flight and one in its
+        // inbox, so at least two of them overflow.
+        wait_until(|| sink.letters.lock().unwrap().len() >= 2).await;
+        gate.add_permits(4);
+        let _ = broker.stop().await;
+
+        let letters = sink.letters.lock().unwrap();
+        assert_eq!(handled.load(Ordering::SeqCst) + letters.len(), 4);
+        assert!(letters.iter().all(|letter| {
+            matches!(letter.reason(), DeadLetterReason::InboxFull) && letter.attempts() == 0
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_subscriptions_survive_restarts_and_change_while_running() {
+        let (first, first_calls) = ScriptedConsumer::new("lifecycle.*", Script::Succeed);
+        let (second, second_calls) = ScriptedConsumer::new("lifecycle.*", Script::Succeed);
+        let contents = |calls: &Calls| {
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|call| call.content.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let broker = EventBroker::new(4);
+        let first_handle = broker.add_topic_consumer(first).unwrap();
+        let broker = broker.run().unwrap();
+        broker
+            .get_sender()
+            .send(EventMessage::new("lifecycle.event", "1").unwrap())
+            .await
+            .unwrap();
+        let broker = broker.stop().await.run().unwrap();
+
+        broker
+            .get_sender()
+            .send(EventMessage::new("lifecycle.event", "2").unwrap())
+            .await
+            .unwrap();
+        wait_until(|| first_calls.lock().unwrap().len() == 2).await;
+        assert!(broker.remove_topic_consumer(first_handle));
+        broker.add_topic_consumer(second).unwrap();
+        broker
+            .get_sender()
+            .send(EventMessage::new("lifecycle.event", "3").unwrap())
+            .await
+            .unwrap();
+        let _ = broker.stop().await;
+
+        assert_eq!(contents(&first_calls), ["1", "2"]);
+        assert_eq!(contents(&second_calls), ["3"]);
     }
 }

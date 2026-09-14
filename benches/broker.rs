@@ -9,7 +9,8 @@ use std::{
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::sync::mpsc;
 use topmesys::{
-    EventBroker, EventConsumer, EventEmitter, EventMessage, EventSubmission, EventTopic,
+    Delivery, EventBroker, EventConsumer, EventEmitter, EventMessage, EventSubmission, EventTopic,
+    HandlerError, Subscriptions,
 };
 
 #[derive(Debug)]
@@ -20,11 +21,13 @@ struct CountingConsumer {
 
 #[async_trait::async_trait]
 impl EventConsumer for CountingConsumer {
-    fn consumes(&self) -> &str {
-        &self.topic
+    type Topic = ();
+
+    fn subscriptions(&self) -> Subscriptions<()> {
+        self.topic.as_str().into()
     }
 
-    async fn handle_event(&self, _event: Arc<EventMessage>) -> anyhow::Result<()> {
+    async fn handle_event(&self, _topic: &(), _delivery: &Delivery) -> Result<(), HandlerError> {
         self.counter.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -75,6 +78,8 @@ fn bench_topic_parsing(c: &mut Criterion) {
     group.finish();
 }
 
+// Keeps its original group name, so results stay comparable with runs from before
+// `find_consumer` was renamed to `find_subscriptions`.
 fn bench_find_consumer(c: &mut Criterion) {
     let mut group = c.benchmark_group("find_consumer");
     for subscriptions in [10usize, 100, 1000] {
@@ -94,7 +99,7 @@ fn bench_find_consumer(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::from_parameter(subscriptions),
             &subscriptions,
-            |b, _| b.iter(|| broker.find_consumer(black_box(&topic))),
+            |b, _| b.iter(|| broker.find_subscriptions(black_box(&topic))),
         );
     }
     group.finish();
