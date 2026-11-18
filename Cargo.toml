@@ -6,15 +6,18 @@ keywords = ["message", "pubsub", "broker", "event", "topic"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 homepage = "https://github.com/sashakm/topmesys"
-version = "0.2.1"
+# Repository tooling, not part of the crate.
+exclude = [".github", ".claude", "CLAUDE.md", "justfile", "release-plz.toml"]
+version = "0.3.0"
 edition = "2024"
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
 dashmap = "6.2"
 futures-util = "0.3"
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tracing = "0.1"
 bytes = "1.12"
@@ -22,7 +25,7 @@ thiserror = "2.0"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
-tokio = { version = "1.52", features = ["time"] }
+tokio = { version = "1.54", features = ["time"] }
 
 [[bench]]
 name = "broker"
