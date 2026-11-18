@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::BTreeMap,
     fmt::Display,
     marker::PhantomData,
     sync::{Arc, PoisonError},
@@ -788,29 +789,40 @@ impl EventBroker<Running> {
 }
 
 /// A type representing an event handled by the applications event bus, consisting
-/// of a [Into] [String] subject and [Into] [Bytes] content.
+/// of a [Into] [String] subject, [Into] [Bytes] content and string headers.
+///
+/// Headers carry what is about the message rather than in it: an event id, a
+/// correlation id, a W3C `traceparent`. The broker never reads them; they travel with
+/// the message to every consumer and dead letter sink, so a bridge to another messaging
+/// system can map them onto that system's own headers.
 ///
 /// Messages received from another messaging system can additionally carry a [TransportHandle],
-/// which the broker settles once the message was delivered. Clones and comparisons only take topic
-/// and content into account: a clone leaves the handle behind, so only the original settles it.
+/// which the broker settles once the message was delivered. Clones and comparisons take topic,
+/// content and headers into account, but not the handle: a clone leaves it behind, so only the
+/// original settles it.
 /// #### Example
 /// ```
 /// use topmesys::{EventMessage, EventTopic};
 ///
 /// let content = vec![123, 34, 116, 111, 34, 58, 34, 116, 104, 101, 109, 34, 125];
 ///
-/// let first_msg = EventMessage::new("my-message", content).unwrap();
+/// let first_msg = EventMessage::new("my-message", content)
+///     .unwrap()
+///     .with_header("correlation-id", "c-42");
 /// let second_msg = EventMessage::default()
 ///     .with_topic(EventTopic::new("my-message").as_routing_key().unwrap())
 ///     .with_content(r#"{"to":"them"}"#);
 ///
 /// assert_eq!(first_msg.topic(), second_msg.topic());
 /// assert_eq!(first_msg.content(), second_msg.content());
+/// assert_eq!(first_msg.header("correlation-id"), Some("c-42"));
+/// assert_eq!(second_msg.header("correlation-id"), None);
 /// ```
 #[derive(Debug, Default)]
 pub struct EventMessage {
     topic: EventTopic<RoutingKey>,
     content: Bytes,
+    headers: BTreeMap<String, String>,
     transport: Option<Box<dyn TransportHandle>>,
 }
 
@@ -819,6 +831,7 @@ impl Clone for EventMessage {
         Self {
             topic: self.topic.clone(),
             content: self.content.clone(),
+            headers: self.headers.clone(),
             transport: None,
         }
     }
@@ -826,7 +839,7 @@ impl Clone for EventMessage {
 
 impl PartialEq for EventMessage {
     fn eq(&self, other: &Self) -> bool {
-        self.topic == other.topic && self.content == other.content
+        self.topic == other.topic && self.content == other.content && self.headers == other.headers
     }
 }
 
@@ -840,6 +853,7 @@ impl EventMessage {
         Ok(Self {
             topic: EventTopic::new(topic_text.into()).as_routing_key()?,
             content: content.into(),
+            headers: BTreeMap::new(),
             transport: None,
         })
     }
@@ -850,6 +864,16 @@ impl EventMessage {
 
     pub fn content(&self) -> &Bytes {
         &self.content
+    }
+
+    /// The value of header `name`, if the message carries it.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).map(String::as_str)
+    }
+
+    /// Every header, ordered by name.
+    pub fn headers(&self) -> &BTreeMap<String, String> {
+        &self.headers
     }
 
     /// The message's transport handle, if it carries one of type `T`.
@@ -872,6 +896,25 @@ impl EventMessage {
     /// Self-consuming content setter
     pub fn with_content(mut self, content: impl Into<Bytes>) -> Self {
         self.content = content.into();
+        self
+    }
+
+    /// Self-consuming header setter. Setting a header again replaces its value.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
+    }
+
+    /// Self-consuming setter for several headers at once.
+    pub fn with_headers(
+        mut self,
+        headers: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.headers.extend(
+            headers
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into())),
+        );
         self
     }
 
@@ -908,6 +951,7 @@ mod tests {
         content: String,
         attempt: u32,
         transport: Option<&'static str>,
+        headers: std::collections::BTreeMap<String, String>,
     }
 
     type Calls = Arc<Mutex<Vec<Call>>>;
@@ -955,6 +999,7 @@ mod tests {
                 transport: delivery
                     .transport::<RecordingHandle>()
                     .map(|handle| handle.id),
+                headers: delivery.message().headers().clone(),
             };
             self.calls.lock().unwrap().push(call);
             match self.script {
@@ -1630,6 +1675,51 @@ mod tests {
         let settlements = settlements.lock().unwrap();
         assert_eq!(settlements.len(), 1);
         assert!(settlements[0].1.all_handled());
+    }
+
+    #[tokio::test]
+    async fn test_headers_reach_every_consumer_unchanged() {
+        let (first, first_calls) = ScriptedConsumer::new("orders.*", Script::Succeed);
+        let (second, second_calls) = ScriptedConsumer::new("orders.created", Script::Succeed);
+        let broker = EventBroker::new(4).run().unwrap();
+        broker.add_topic_consumer(first).unwrap();
+        broker.add_topic_consumer(second).unwrap();
+
+        let message = EventMessage::new("orders.created", "A-1")
+            .unwrap()
+            .with_header("correlation-id", "c-42")
+            .with_headers([("traceparent", "00-abc-def-01")]);
+        broker.get_sender().send(message).await.unwrap();
+        let _ = broker.stop().await;
+
+        for calls in [first_calls, second_calls] {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].headers.get("correlation-id").map(String::as_str),
+                Some("c-42")
+            );
+            assert_eq!(
+                calls[0].headers.get("traceparent").map(String::as_str),
+                Some("00-abc-def-01")
+            );
+        }
+    }
+
+    #[test]
+    fn test_clones_and_comparisons_include_headers_but_not_the_transport() {
+        let settlements = Settlements::default();
+        let retries = Arc::new(AtomicUsize::new(0));
+        let original = EventMessage::new("jobs.render", "job")
+            .unwrap()
+            .with_header("event-id", "e-1")
+            .with_transport(RecordingHandle::new("job", &settlements, &retries));
+
+        let copy = original.clone();
+        assert_eq!(copy, original);
+        assert_eq!(copy.header("event-id"), Some("e-1"));
+        assert!(copy.transport_handle().is_none());
+        assert_ne!(copy.clone().with_header("event-id", "e-2"), original);
     }
 
     #[tokio::test]
