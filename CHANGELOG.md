@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1](https://github.com/sashakm/topmesys/compare/v0.3.0...v0.3.1) - 2026-11-18
+
+### 🚀 Features
+
+- Add header map to EventMessage ([#8](https://github.com/sashakm/topmesys/pull/8))
+
 ## [0.3.0](https://github.com/sashakm/topmesys/compare/v0.2.1...v0.3.0) - 2026-11-18
 
 ### ⚙️ Miscellaneous Tasks
