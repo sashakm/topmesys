@@ -1,0 +1,54 @@
+# Release configuration — https://release-plz.dev/docs/config
+#
+# Flow: every push to main updates one release PR (version bump + CHANGELOG.md, computed
+# from conventional commits, API breaks caught by cargo-semver-checks). Merging that PR
+# publishes to crates.io, tags `v<version>` and creates the GitHub release. See
+# .github/workflows/release-plz.yml.
+
+[workspace]
+# Release when a release PR is merged, never on an ordinary push to main.
+release_always = false
+# The release PR touches the crate version only; dependency updates come from Dependabot.
+dependencies_update = false
+semver_check = true
+pr_labels = ["release"]
+publish_timeout = "10m"
+
+# Grouping carried over from the former cliff.toml. Only a commit's first line is parsed,
+# so a breaking change needs `!` in that header or a `BREAKING CHANGE:` footer.
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+"""
+body = """
+## [{{ version }}]{%- if release_link -%}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}*({{ commit.scope }})* {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message | upper_first }}
+{%- endfor %}
+{% endfor %}
+"""
+trim = true
+sort_commits = "oldest"
+# Keep a breaking change even when a parser below would skip its commit.
+protect_breaking_commits = true
+commit_parsers = [
+    { message = "^feat", group = "<!-- 0 -->🚀 Features" },
+    { message = "^fix", group = "<!-- 1 -->🐛 Bug Fixes" },
+    { message = "^refactor", group = "<!-- 2 -->🚜 Refactor" },
+    { message = "^doc", group = "<!-- 3 -->📚 Documentation" },
+    { message = "^perf", group = "<!-- 4 -->⚡ Performance" },
+    { message = "^style", group = "<!-- 5 -->🎨 Styling" },
+    { message = "^test", group = "<!-- 6 -->🧪 Testing" },
+    { message = "^chore: release", skip = true },
+    { message = "^chore\\(deps.*\\)", skip = true },
+    { message = "^chore\\(pr\\)", skip = true },
+    { message = "^chore\\(pull\\)", skip = true },
+    { message = "^chore|^ci", group = "<!-- 7 -->⚙️ Miscellaneous Tasks" },
+    { body = ".*security", group = "<!-- 8 -->🛡️ Security" },
+    { message = "^revert", group = "<!-- 9 -->◀️ Revert" },
+]

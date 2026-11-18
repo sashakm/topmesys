@@ -342,7 +342,7 @@ impl FromIterator<EventMessage> for EventSubmission {
     }
 }
 
-/// Enables implementors to submit one or more [EventMessage]s to a [channel](Sender) connected
+/// Enables implementors to submit one or more [EventMessage]s to a [channel](mpsc::Sender) connected
 /// to an [EventBroker]. When overriding the [submit_event](EventEmitter::submit_event) default implementation,
 /// implementors should ensure that cancel safety is maintained by using the channels [reserve](mpsc::Sender::reserve)
 /// method. Under normal circumstances, the EventBroker will handle any outstanding [permits](tokio::sync::mpsc::Permit)
@@ -451,7 +451,7 @@ pub struct SubscriptionHandle {
 /// [DeadLetterSink]. When an inbox is full, the subscription's [Overflow] policy decides whether routing waits or the
 /// message is dead-lettered. Messages whose topic doesn't match any subscription are dropped silently, and messages
 /// carrying a [TransportHandle] are settled once all of their deliveries finished.
-/// Messages are submitted to the channel using a [Sender<EventMessage>], produced by the [get_sender](EventBroker::get_sender) method.
+/// Messages are submitted to the channel using a [`Sender<EventMessage>`](mpsc::Sender), produced by the [get_sender](EventBroker::get_sender) method.
 /// While the sender can be used for submissions "as is", the [submit_event][EventEmitter::submit_event] from the [EventEmitter] trait provides a safe default
 /// implementation using [channel permits](tokio::sync::mpsc::Permit), conveniently supporting both single and batched [EventSubmission]s.
 #[derive(Debug)]

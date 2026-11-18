@@ -2,13 +2,17 @@
 @default:
   just --list
 
-changelog := "CHANGELOG.md"
-
-# check formatting and run clippy
+# check formatting, run clippy on every target and build the docs, warnings as errors
 [group('Linting')]
 @check:
   cargo fmt --check
-  cargo clippy
+  cargo clippy --all-targets -- -D warnings
+  RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+# build the library on the declared rust-version (needs `rustup toolchain install 1.88`)
+[group('Linting')]
+@msrv:
+  cargo +1.88 check --locked
 
 # run doc tests
 [group('Testing')]
@@ -19,15 +23,9 @@ changelog := "CHANGELOG.md"
 [group('Testing')]
 @test format="--json" : test-doc
   cargo llvm-cov --all-targets --examples --cobertura --output-path coverage.xml
-  cargo llvm-cov report {{format}} --summary-only 
+  cargo llvm-cov report {{format}} --summary-only
 
-# generate a new changelog entry
+# package and verify the crate the way crates.io will see it, without uploading
 [group('Release')]
-@log-changes tag:
-  git cliff -o {{changelog}} -t {{tag}}
-
-# publish the current state of affairs
-[group('Release')]
-@publish: check test
-  cargo publish
-  
+@package *args:
+  cargo package {{args}}
