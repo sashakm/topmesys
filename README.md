@@ -123,6 +123,15 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+Messages can carry string headers for what is about the event rather than in it, such as an
+event id, a correlation id or a W3C `traceparent`. The broker passes them through untouched:
+
+```rust
+let event = EventMessage::new("orders.eu.created", r#"{"order":"A-1001"}"#)?
+    .with_header("correlation-id", "8f14e45f-ea1a-4a2c-9a1e-2d4c1f0b3a77");
+// in a consumer: delivery.message().header("correlation-id")
+```
+
 Errors returned from `handle_event` are retried according to the subscription's `RetryPolicy`;
 return `HandlerError::permanent(error)` for errors retrying won't fix. Messages a subscription
 gives up on are handed to the `DeadLetterSink` set with `EventBroker::with_dead_letter_sink` or
