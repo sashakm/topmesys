@@ -1,0 +1,68 @@
+# Release pipeline, driven by release-plz (configuration: release-plz.toml).
+#
+#   push to main ──▶ release-pr: open or update the release PR
+#                    (version bump, CHANGELOG.md, cargo-semver-checks report)
+#   merge that PR ─▶ release:    publish to crates.io, tag v<version>,
+#                                create the GitHub release
+#
+# Secrets:
+#   RELEASE_PLZ_TOKEN  optional, recommended. A fine-grained PAT or GitHub App token with
+#                      contents + pull-requests write. Pull requests opened with the
+#                      default GITHUB_TOKEN do not trigger other workflows, so without it
+#                      CI never runs on the release PR.
+#
+# crates.io authentication is trusted publishing (OIDC, `id-token: write`): no registry
+# token is stored here. Configure the trusted publisher on crates.io first, see
+# RELEASING.md.
+name: release-plz
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release:
+    name: Publish merged release
+    if: ${{ github.repository_owner == 'sashakm' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    # No concurrency group: a pending release must never be cancelled by a newer push.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz release
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+  release-pr:
+    name: Open or update the release PR
+    if: ${{ github.repository_owner == 'sashakm' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz release-pr
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
