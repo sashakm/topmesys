@@ -75,7 +75,7 @@ jobs:
         with:
           persist-credentials: false
       # Keep in step with `rust-version` in Cargo.toml.
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.120
       - uses: taiki-e/install-action@v2
         with:
           tool: just
