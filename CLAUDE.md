@@ -61,7 +61,8 @@ trait method over a new required one, `#[non_exhaustive]` on enums that will gro
 ## Releasing and commits
 
 Conventional commits, one change per commit: release-plz reads only the first line.
-Pushing to `main` updates the release PR; merging it publishes. Never run
+Pushing to `main` updates the release PR; merging it publishes, once a reviewer approves
+the `release` environment. Never run
 `cargo publish`, `cargo yank` or `cargo owner` (the project settings deny them), and never
 edit `CHANGELOG.md` by hand. Details, including the pending 0.2.1 yank: `RELEASING.md`.
 

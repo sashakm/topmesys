@@ -2,8 +2,16 @@
 #
 #   push to main ──▶ release-pr: open or update the release PR
 #                    (version bump, CHANGELOG.md, cargo-semver-checks report)
-#   merge that PR ─▶ release:    publish to crates.io, tag v<version>,
-#                                create the GitHub release
+#   merge that PR ─▶ pending:    is the pushed commit a merged release PR?
+#                    release:    once a reviewer of the `release` environment approves,
+#                                publish to crates.io, tag v<version>, create the
+#                                GitHub release
+#
+# The `release` environment is the gate before crates.io: its required reviewers approve
+# each publish, and the trusted publisher on crates.io accepts only OIDC tokens issued to
+# jobs in it (RELEASING.md). `pending` applies the test release-plz itself applies for
+# `release_always = false` (the commit belongs to a merged PR from a `release-plz-`
+# branch), so an ordinary push to main asks nobody for an approval.
 #
 # Secrets:
 #   RELEASE_PLZ_TOKEN  optional, recommended. A fine-grained PAT or GitHub App token with
@@ -22,10 +30,33 @@ on:
       - main
 
 jobs:
-  release:
-    name: Publish merged release
+  pending:
+    name: Check for a merged release PR
     if: ${{ github.repository_owner == 'sashakm' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - name: Is the pushed commit a merged release PR?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq 'any(.[]; .merged_at != null and (.head.ref | startswith("release-plz-")))')"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Publish merged release
+    needs: pending
+    if: ${{ needs.pending.outputs.release == 'true' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: https://crates.io/crates/topmesys
     permissions:
       contents: write
       pull-requests: read

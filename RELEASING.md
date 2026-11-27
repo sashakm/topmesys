@@ -10,8 +10,14 @@ Releases are automated with [release-plz](https://release-plz.dev). Configuratio
    tag, and runs cargo-semver-checks against the published API.
 2. Review the PR: is the bump right, and does the changelog read well? Edit the PR if
    needed.
-3. Merge it. The release job publishes to crates.io, tags `v<version>` and creates the
-   GitHub release.
+3. Merge it. The release job then waits for a reviewer of the `release` environment: open
+   the workflow run, *Review deployments*, approve. It publishes to crates.io, tags
+   `v<version>` and creates the GitHub release.
+
+Only a push that merges a release PR asks for that approval. The `pending` job checks
+whether the pushed commit belongs to a merged PR from a `release-plz-` branch, which is
+the test release-plz itself applies with `release_always = false`. On any other push the
+release job is skipped.
 
 ## Commit messages decide the version
 
@@ -41,9 +47,24 @@ calculation.
    trigger other workflows, so CI does not run on the release PR. A fine-grained PAT (or
    a GitHub App token) with *contents* and *pull requests* write access, stored as the
    `RELEASE_PLZ_TOKEN` secret, fixes that.
-3. **Trusted publishing.** On crates.io: topmesys → Settings → Trusted Publishing → add
-   GitHub, repository `sashakm/topmesys`, workflow `release-plz.yml`. The release job
-   authenticates with OIDC (`id-token: write`); no registry token is stored anywhere.
+3. **The `release` environment.** Settings → Environments → New environment, named
+   `release`:
+   - *Required reviewers*: yourself. Leave *Prevent self-review* off: your merge triggers
+     the run, so that option would stop you from approving your own release.
+   - *Deployment branches and tags*: *Selected branches and tags*, rule `main`.
+
+   Create it before the next release: a workflow that names a missing environment creates
+   it without any protection. Required reviewers are available on public repositories
+   on every plan; a private repository needs a paid one.
+4. **Trusted publishing.** On crates.io: topmesys → Settings → Trusted Publishing → add
+   GitHub, repository `sashakm/topmesys`, workflow `release-plz.yml`, environment
+   `release`. The release job authenticates with OIDC (`id-token: write`); no registry
+   token is stored anywhere.
+
+   A publisher added before the environment existed has no environment, and then a job
+   outside `release` can still get a token from it. Add `release` to it (or remove the
+   publisher and add it again), but only once this workflow is on `main`: a publisher
+   that names an environment refuses tokens from a job that runs without one.
 
 ## 0.3.0: re-releasing 0.2.1
 
