@@ -1,0 +1,4 @@
+# Default owner of every path. With "Require review from Code Owners" in the ruleset on
+# main, a pull request merges only with an approval from @sashakm; approvals by other
+# collaborators (the sandbox's bot account included) or by GitHub Actions do not count.
+* @sashakm
