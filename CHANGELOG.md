@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2](https://github.com/sashakm/topmesys/compare/v0.3.1...v0.3.2) - 2026-11-27
+
+### 🚜 Refactor
+
+- *(ci)* Configure approval and release permissions ([#11](https://github.com/sashakm/topmesys/pull/11))
+
 ## [0.3.1](https://github.com/sashakm/topmesys/compare/v0.3.0...v0.3.1) - 2026-11-18
 
 ### 🚀 Features
